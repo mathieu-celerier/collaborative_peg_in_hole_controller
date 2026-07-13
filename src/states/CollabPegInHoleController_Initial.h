@@ -2,7 +2,7 @@
 
 #include <mc_control/fsm/State.h>
 
-struct NewFSMController_Initial : mc_control::fsm::State
+struct CollabPegInHoleController_Initial : mc_control::fsm::State
 {
 
   void configure(const mc_rtc::Configuration & config) override;

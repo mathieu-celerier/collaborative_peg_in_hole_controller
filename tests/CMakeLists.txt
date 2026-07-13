@@ -4,13 +4,13 @@ file(
   INPUT "${CMAKE_CURRENT_SOURCE_DIR}/etc/mc_rtc.yaml")
 
 set(MC_STATES_RUNTIME_INSTALL_PREFIX
-    "$<TARGET_FILE_DIR:NewFSMController_Initial>")
-configure_file("${PROJECT_SOURCE_DIR}/etc/NewFSMController.in.yaml"
-               "${CMAKE_CURRENT_BINARY_DIR}/etc/NewFSMController.cmake.yaml")
+    "$<TARGET_FILE_DIR:CollabPegInHoleController_Initial>")
+configure_file("${PROJECT_SOURCE_DIR}/etc/CollabPegInHoleController.in.yaml"
+               "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.cmake.yaml")
 file(
   GENERATE
-  OUTPUT "$<TARGET_FILE_DIR:NewFSMController>/etc/NewFSMController.yaml"
-  INPUT "${CMAKE_CURRENT_BINARY_DIR}/etc/NewFSMController.cmake.yaml")
+  OUTPUT "$<TARGET_FILE_DIR:CollabPegInHoleController>/etc/CollabPegInHoleController.yaml"
+  INPUT "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.cmake.yaml")
 
 if(MSVC AND _VCPKG_INSTALLED_DIR)
   set(VCPKG_INSTALL_PREFIX "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_PREFIX}")

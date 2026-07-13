@@ -1,8 +1,8 @@
 {
-  "name": "mc-rtc-new-fsm-controller",
+  "name": "mc-rtc-collab-peg-in-hole-controller",
   "version-string": "1.0.0",
   "homepage": "",
-  "description": "NewFSMController for mc_rtc",
+  "description": "CollabPegInHoleController for mc_rtc",
   "dependencies": [
     "mc-rtc"
   ]
