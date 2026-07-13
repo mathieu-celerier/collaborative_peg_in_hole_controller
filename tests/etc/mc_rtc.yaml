@@ -5,4 +5,5 @@ LoadUserConfiguration: false
 
 IncludeHalfSitController: false
 ClearControllerModulePath: true
+ClearGlobalPluginPath: true
 ControllerModulePaths: ["$<TARGET_FILE_DIR:CollabPegInHoleController>"]
