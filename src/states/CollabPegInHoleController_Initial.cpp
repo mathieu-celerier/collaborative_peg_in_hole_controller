@@ -7,13 +7,18 @@ void CollabPegInHoleController_Initial::configure(const mc_rtc::Configuration & 
 void CollabPegInHoleController_Initial::start(mc_control::fsm::Controller & ctl_)
 {
   auto & ctl = static_cast<CollabPegInHoleController &>(ctl_);
+  ctl.switchToInitialState();
 }
 
 bool CollabPegInHoleController_Initial::run(mc_control::fsm::Controller & ctl_)
 {
   auto & ctl = static_cast<CollabPegInHoleController &>(ctl_);
-  output("OK");
-  return true;
+  if(ctl.requestedState() == "Compliant")
+  {
+    output("GoToCompliant");
+    return true;
+  }
+  return false;
 }
 
 void CollabPegInHoleController_Initial::teardown(mc_control::fsm::Controller & ctl_)

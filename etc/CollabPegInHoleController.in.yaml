@@ -2,57 +2,91 @@
 # If true, the FSM transitions are managed by an external tool
 Managed: false
 # If true and the FSM is self-managed, transitions should be triggered
-StepByStep: true
+StepByStep: false
 # Change idle behaviour, if true the state is kept until transition,
 # otherwise the FSM holds the last state until transition
-IdleKeepState: false
+IdleKeepState: true
 # Where to look for state libraries
 StatesLibraries:
-- "@MC_STATES_DEFAULT_RUNTIME_INSTALL_PREFIX@"
-- "@MC_STATES_RUNTIME_INSTALL_PREFIX@"
+  - "@MC_STATES_DEFAULT_RUNTIME_INSTALL_PREFIX@"
+  - "@MC_STATES_RUNTIME_INSTALL_PREFIX@"
 # Where to look for state files
 StatesFiles:
-- "@MC_STATES_DEFAULT_RUNTIME_INSTALL_PREFIX@/data"
-- "@MC_STATES_RUNTIME_INSTALL_PREFIX@/data"
+  - "@MC_STATES_DEFAULT_RUNTIME_INSTALL_PREFIX@/data"
+  - "@MC_STATES_RUNTIME_INSTALL_PREFIX@/data"
 # If true, state factory will be more verbose
 VerboseStateFactory: false
-# Additional robots to load
-robots:
-  ground:
-    module: env/ground
-# General constraints, always on
-constraints:
-- type: contact
-- type: dynamics
-  damper: [0.1, 0.01, 0.5]
-- type: compoundJoint
-# Collision constraint
-collisions:
-- type: collision
-  useMinimal: true
-# Initial set of contacts
-contacts:
-- r1: jvrc1
-  r2: ground
-  r1Surface: LeftFoot
-  r2Surface: AllGround
-- r1: jvrc1
-  r2: ground
-  r1Surface: RightFoot
-  r2Surface: AllGround
 
-# Some options for a specific robot
-jvrc1:
-  posture:
-    stiffness: 1
-    weight: 10
-  ff:
-    stiffness: 2
-    weight: 100
-# Implement some additional text states
+# Collision constraint (self-collisions, minimal set)
+collisions:
+  - type: collision
+    useMinimal: true
+
+# Plugins:
+#  - RosForceSensor feeds the Bota F/T wrench (person B channel) into EEForceSensor.
+#    It self-gates: it only writes once it receives a message on the sensor topic,
+#    so it feeds the wrench on the real robot (mc_kortex) and is a no-op under
+#    mc_mujoco (where the simulator populates the sensor).
+#  - ExternalForcesEstimator provides the joint-torque residual (person A channel).
+Plugins: [RosForceSensor, ExternalForcesEstimator]
+
+# Encoder observer pipeline (needed for the residual / feedback).
+ObserverPipelines:
+  - name: Pipeline
+    observers:
+      - type: Encoder
+        velocity: encoderVelocities
+
+# Per-robot configuration (keyed by robot module name).
+KinovaBotaPegPlate:
+  tool_frame: "FT_sensor_wrench"
+  ft_sensor: "EEForceSensor"
+  insertion_frame: "tool"
+  initial_posture: [0.0, 0.262, 3.14, -2.269, 0.0, 0.96, 1.57]
+  # What drives the free/hold trigger:
+  #  external = full external wrench reconstructed from the estimator's external joint
+  #             torques (residual fused with the F/T sensor). Sees BOTH the person guiding
+  #             the arm behind the sensor AND the person moving the plate. Requires the
+  #             ExternalForcesEstimator plugin to be loaded and active.
+  #  ft       = F/T sensor only (plate/person B only) - the previous behaviour.
+  trigger_source: external
+  # Trigger wrench-norm thresholds (hysteresis): free the end-effector above 'enter',
+  # re-stiffen below 'exit'.
+  dual_force_enter: 5.0
+  dual_force_exit: 2.0
+  # Anti-chatter smoothing of the free/hold trigger (cf. box controller):
+  wrench_filter_time: 0.1 # low-pass time constant on the wrench norm (s)
+  trigger_averaging_window: 0.0 # moving-average window on the trigger (s); 0 = off
+  gain_transition_time: 0.2 # exponential stiffness/damping ramp time constant (s)
+  # End-effector task tuning.
+  ee_hold_stiffness: 400.0 # stiffness while holding position
+  ee_hold_damping: 40.0 # damping while holding position (ramp target)
+  ee_free_damping: 15.0 # damping while freed (stiffness 0) on contact
+  ee_task_weight: 10000.0 # end-effector task weight
+  # Posture task tuning.
+  initial_posture_stiffness: 0.5 # posture stiffness in the Initial state
+  posture_compliant_damping: 2.0 # posture damping in the Compliant state
+  # ExternalForcesEstimator residual gain (person A responsiveness).
+  residual_gain: 30.0
+  # Safety velocity-damper parameters (closed-loop dynamics constraint).
+  vel_damper_m: 1.2
+  vel_damper_lambda: 70.0
+
+# No additional text states
 states: {}
 # Transitions map
 transitions:
-- [CollabPegInHoleController_Initial, OK, CollabPegInHoleController_Initial, Strict]
+  - [
+      CollabPegInHoleController_Initial,
+      GoToCompliant,
+      CollabPegInHoleController_Compliant,
+      Auto,
+    ]
+  - [
+      CollabPegInHoleController_Compliant,
+      GoToInitial,
+      CollabPegInHoleController_Initial,
+      Auto,
+    ]
 # Initial state
 init: CollabPegInHoleController_Initial

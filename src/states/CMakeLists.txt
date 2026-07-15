@@ -1,3 +1,4 @@
 add_fsm_state_simple(CollabPegInHoleController_Initial)
+add_fsm_state_simple(CollabPegInHoleController_Compliant)
 
 add_fsm_data_directory(data)

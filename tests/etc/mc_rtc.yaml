@@ -1,5 +1,5 @@
 # This configuration is used to run a few iterations of the controller
-MainRobot: JVRC1
+MainRobot: KinovaBotaPegPlate
 Enabled: CollabPegInHoleController
 LoadUserConfiguration: false
 
