@@ -1127,11 +1127,11 @@
         "mc-rtc-nix": "mc-rtc-nix"
       },
       "locked": {
-        "lastModified": 1785830845,
-        "narHash": "sha256-cAtwV/fmGwlvt1QehjdgI7CULQf0vfMwM7PSl1wx2qw=",
+        "lastModified": 1785840952,
+        "narHash": "sha256-Tvj8dMqUjTfA7s+HvaiGM+sBQSr8RvFPoev4KR1gcik=",
         "owner": "mathieu-celerier",
         "repo": "mc-rtc-kinova-base",
-        "rev": "64cff5790b846e4e45cd087099ef9e33b240ad90",
+        "rev": "9e4e1c2e5a3d55d79f5d5ff6f8881f2420d0f5c8",
         "type": "github"
       },
       "original": {
@@ -1156,11 +1156,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1785830882,
-        "narHash": "sha256-NlX5npFte9KiQ1k/wRdv871GkH8DS/vUqz9wMDPs1j0=",
+        "lastModified": 1785848778,
+        "narHash": "sha256-7G66ASaL1JTyVOi4Ux55Jlq2XCSdLFOFiFKTMjSjYnc=",
         "owner": "mathieu-celerier",
         "repo": "mc-rtc-kinova-external-forces",
-        "rev": "69ce7e09c68378037bf3e61d64884f106a773641",
+        "rev": "0c2cce60075cac10bae04688b2c4d30e135c54e7",
         "type": "github"
       },
       "original": {
