@@ -28,3 +28,9 @@ configure_file(etc/CollabPegInHoleController.in.yaml
                "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.yaml")
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.yaml"
         DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc")
+
+# Per-controller plugin config override, read by mc_rtc from
+# etc/CollabPegInHoleController/plugins/<Plugin>.yaml under this install prefix (see
+# MCGlobalController::GlobalConfiguration::load_controller_plugin_configs()).
+install(FILES "etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml"
+        DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc/CollabPegInHoleController/plugins")

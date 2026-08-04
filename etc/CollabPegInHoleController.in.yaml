@@ -30,16 +30,12 @@ collisions:
 #  - ExternalForcesEstimator provides the joint-torque residual (person A channel).
 Plugins: [RosForceSensor, ExternalForcesEstimator]
 
-# mc-residual-estimation's own default (etc/ExternalForcesEstimator.in.yaml) sets
-# reference_frame: FT_frame, a generic placeholder body name that does not exist on
-# kinova_bota_peg_plate (its URDF has no "FT_frame" link) - the plugin's rbd::Jacobian
-# construction does an unguarded map lookup on it and crashes with unordered_map::at on init.
-# Override with this robot's real sensor frame/name (matches KinovaBotaPegPlate's tool_frame
-# and ft_sensor below).
-ExternalForcesEstimator:
-  reference_frame: FT_sensor_wrench
-  ft_sensor_name: EEForceSensor
-  use_force_sensor: true
+# ExternalForcesEstimator's config override lives in
+# etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml, not here: mc_rtc's
+# MCGlobalController::GlobalConfiguration::load_controller_plugin_configs() only reads a
+# per-controller plugin override from that dedicated path (etc/<Controller>/plugins/<Plugin>.yaml
+# under the controller's own install prefix) - a top-level `ExternalForcesEstimator:` key in
+# this file is never read for plugin init.
 
 # Encoder observer pipeline (needed for the residual / feedback).
 ObserverPipelines:

@@ -1,0 +1,9 @@
+# Per-controller override for the ExternalForcesEstimator plugin, read by mc_rtc's
+# load_controller_plugin_configs() from etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml
+# under the controller's install prefix. Merged on top of the plugin's own shipped default
+# (mc-residual-estimation's etc/ExternalForcesEstimator.in.yaml), which sets reference_frame:
+# FT_frame - a generic placeholder body name that does not exist on kinova_bota_peg_plate (its
+# URDF has no "FT_frame" link), so rbd::Jacobian's construction throws unordered_map::at on init.
+reference_frame: FT_sensor_wrench
+ft_sensor_name: EEForceSensor
+use_force_sensor: true
