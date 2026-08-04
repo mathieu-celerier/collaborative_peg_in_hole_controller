@@ -41,6 +41,16 @@ mkMcRtcController {
       apps = [ "mc-mujoco" ];
       robots = [ "mc-kinova" ];
     };
+
+    # Packages we hack on from source rather than consuming from the nix store. These are only
+    # consulted by the '-devel' shell, where mc-rtc-nix pulls in their *build* dependencies
+    # (inputsFrom) and prepends $PWD/.superbuild/install to ControllerModulePaths /
+    # RobotModulePaths / GlobalPluginPaths — so a local cmake install of these shadows the
+    # nix-built copy with no flake edit, no hash, and no rebuild of the nix package.
+    devel = {
+      robots = [ "mc-kinova" ];
+      plugins = [ "mc-residual-estimation" ];
+    };
   };
 
   meta = with lib; {
