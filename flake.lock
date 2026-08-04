@@ -1156,11 +1156,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1785853513,
-        "narHash": "sha256-z2Ibv89uDlqXBgU4oT4RSjx40CJsbQdf8a6guPhlAus=",
+        "lastModified": 1785855806,
+        "narHash": "sha256-A+Ytx9rGeMgxkjjOfDDY5ZwpJMfrRh5q05lq8OEooOg=",
         "owner": "mathieu-celerier",
         "repo": "mc-rtc-kinova-external-forces",
-        "rev": "ab4918cfcad9f9282d12ec5d38c79020eeeac3f4",
+        "rev": "2c5a61e774e9c544dadb3d490488d85910a9bd6c",
         "type": "github"
       },
       "original": {
