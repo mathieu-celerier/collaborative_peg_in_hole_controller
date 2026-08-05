@@ -1122,6 +1122,108 @@
         "type": "github"
       }
     },
+    "mc-kinova-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784111908,
+        "narHash": "sha256-gRTO2WGK26eYrw7Oh/lEyWis3F6hZGJ4ahfz71P6ntQ=",
+        "owner": "mathieu-celerier",
+        "repo": "mc_kinova",
+        "rev": "f362118ab1b66db57e4fa37db3a56a105f752c2d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mathieu-celerier",
+        "ref": "topic/add-genA-bota",
+        "repo": "mc_kinova",
+        "type": "github"
+      }
+    },
+    "mc-kortex-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776058453,
+        "narHash": "sha256-CMaQIJ1cBMjQnK4XuXJcgZUZAmIOzfyZWNVPgn5ZTcc=",
+        "owner": "mathieu-celerier",
+        "repo": "mc_kortex",
+        "rev": "2b6165b826f65244b142f3ee373285d5f4d60e8e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mathieu-celerier",
+        "repo": "mc_kortex",
+        "type": "github"
+      }
+    },
+    "mc-residual-estimation-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777536780,
+        "narHash": "sha256-rzWtNE4mJ73dX+gTR9hdQDTmHlLMMl+8nwJ7KwbA/Nk=",
+        "owner": "mathieu-celerier",
+        "repo": "mc_residual_estimation",
+        "rev": "7ad9a5911da0a0124d1c4857307505e9e7cea226",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mathieu-celerier",
+        "ref": "topic/HumanoidResidual_new_implementation",
+        "repo": "mc_residual_estimation",
+        "type": "github"
+      }
+    },
+    "mc-rtc": {
+      "inputs": {
+        "ccache-trigger": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc",
+          "mc-rtc-nix",
+          "ccache-trigger"
+        ],
+        "flake-parts": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc",
+          "mc-rtc-nix",
+          "flake-parts"
+        ],
+        "gepetto": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc",
+          "mc-rtc-nix",
+          "gepetto"
+        ],
+        "mc-rtc-nix": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc-nix"
+        ],
+        "systems": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc",
+          "mc-rtc-nix",
+          "systems"
+        ],
+        "with-ros-trigger": [
+          "mc-rtc-kinova-external-forces",
+          "mc-rtc",
+          "mc-rtc-nix",
+          "with-ros-trigger"
+        ]
+      },
+      "locked": {
+        "lastModified": 1785940175,
+        "narHash": "sha256-1OGFAgHt5jglSMpFMroMLMpDr5sMex7Wz3NebbDdJXk=",
+        "owner": "mathieu-celerier",
+        "repo": "mc_rtc",
+        "rev": "e96874ff366efc8f214426d07214ec4393dc0d41",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mathieu-celerier",
+        "ref": "topic/second-order-velocity-damper",
+        "repo": "mc_rtc",
+        "type": "github"
+      }
+    },
     "mc-rtc-kinova-base": {
       "inputs": {
         "mc-rtc-nix": "mc-rtc-nix"
@@ -1147,8 +1249,13 @@
           "mc-rtc-nix",
           "flake-parts"
         ],
+        "mc-kinova-src": "mc-kinova-src",
+        "mc-kortex-src": "mc-kortex-src",
+        "mc-residual-estimation-src": "mc-residual-estimation-src",
+        "mc-rtc": "mc-rtc",
         "mc-rtc-kinova-base": "mc-rtc-kinova-base",
         "mc-rtc-nix": "mc-rtc-nix_2",
+        "minimum-jerk-task-src": "minimum-jerk-task-src",
         "systems": [
           "mc-rtc-kinova-external-forces",
           "mc-rtc-nix",
@@ -1156,11 +1263,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1785855806,
-        "narHash": "sha256-A+Ytx9rGeMgxkjjOfDDY5ZwpJMfrRh5q05lq8OEooOg=",
+        "lastModified": 1785944965,
+        "narHash": "sha256-/pA4ayE4FR6HaImC0Nfa/GcEruf+0P1ZEq84RjkCL/I=",
         "owner": "mathieu-celerier",
         "repo": "mc-rtc-kinova-external-forces",
-        "rev": "2c5a61e774e9c544dadb3d490488d85910a9bd6c",
+        "rev": "8fe0e4ec85749ad88920d52f543c7d7219e55c49",
         "type": "github"
       },
       "original": {
@@ -1311,6 +1418,25 @@
         "owner": "mc-rtc",
         "repo": "nixpkgs",
         "type": "github"
+      }
+    },
+    "minimum-jerk-task-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1761536626,
+        "narHash": "sha256-n2gYtqNWlyuP6OIFuFVBXjrXusZ2p3lRQ7ccI7l/AFU=",
+        "ref": "main",
+        "rev": "eb5573e0e0604a04cc2adf7dda9f8d6c6d37474f",
+        "revCount": 19,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/mathieu-celerier/MinimumJerkTask"
+      },
+      "original": {
+        "ref": "main",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/mathieu-celerier/MinimumJerkTask"
       }
     },
     "nix-ros-overlay": {
