@@ -33,4 +33,5 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.yaml"
 # etc/CollabPegInHoleController/plugins/<Plugin>.yaml under this install prefix (see
 # MCGlobalController::GlobalConfiguration::load_controller_plugin_configs()).
 install(FILES "etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml"
+              "etc/CollabPegInHoleController/plugins/RosForceSensor.yaml"
         DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc/CollabPegInHoleController/plugins")

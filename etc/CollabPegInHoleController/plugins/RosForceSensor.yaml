@@ -1,0 +1,23 @@
+# Per-controller override for the RosForceSensor plugin, read by mc_rtc's
+# load_controller_plugin_configs() from etc/CollabPegInHoleController/plugins/RosForceSensor.yaml
+# under the controller's install prefix.
+#
+# mc-ros-force-sensor is pinned to topic/new-implementation rather than main, because only that
+# branch guards the sensor write with `if(!data.isValid()) return;`. Without it the plugin
+# overwrites EEForceSensor with a zero wrench on every tick whenever nothing publishes on the
+# topic - which is every mc_mujoco run - starving the ExternalForcesEstimator's F/T fusion and
+# destabilising the compliance loop.
+#
+# That branch is divergent from main and predates "Update default config for new bota driver",
+# so both defaults below have to be restored explicitly:
+#
+#   reference_frame  - the branch defaults to FT_sensor_force, which is not a body on
+#                      kinova_bota_peg_plate (mc_kinova declares EEForceSensor on
+#                      FT_sensor_wrench). RosForceSensor.cpp calls bodyPosW(reference_frame),
+#                      which throws on an unknown body. Harmless in simulation only because the
+#                      validity guard returns first - it would throw the moment the topic
+#                      actually publishes.
+#   ros_topic_sensor - the branch defaults to the older /bus0/ft_sensor0/ft_sensor_readings/force
+#                      naming; this setup's Bota driver publishes /bota_ft_sensor/wrench.
+reference_frame: FT_sensor_wrench
+ros_topic_sensor: /bota_ft_sensor/wrench

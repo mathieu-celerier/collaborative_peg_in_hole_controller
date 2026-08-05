@@ -45,7 +45,12 @@ ObserverPipelines:
         velocity: encoderVelocities
 
 # Per-robot configuration (keyed by robot module name).
-KinovaBotaPegPlate:
+# Keyed on robot().module().name, which is the snake_case *variant* string built by
+# kinovaVariant() in mc_kinova (src/kinova.cpp:88) — "kinova_bota_peg_plate" — NOT the
+# MainRobotParams name "KinovaBotaPegPlate". CollabPegInHoleController.cpp guards this block
+# with `if(config.has(robot().module().name))`, so a mismatched key is skipped in silence and
+# every value below reverts to its C++ default with no warning.
+kinova_bota_peg_plate:
   tool_frame: "FT_sensor_wrench"
   ft_sensor: "EEForceSensor"
   insertion_frame: "tool"
@@ -74,9 +79,15 @@ KinovaBotaPegPlate:
   initial_posture_stiffness: 0.5 # posture stiffness in the Initial state
   posture_compliant_damping: 2.0 # posture damping in the Compliant state
   # ExternalForcesEstimator residual gain (person A responsiveness).
-  residual_gain: 30.0
+  # 20.0 = COLLAB_HIGH_RESIDUAL_GAIN, the value that has actually been running all along while
+  # this block was dead. The file previously said 30.0; that was never in effect, so adopting it
+  # here would be a 50% gain increase on a loop that has only just been stabilised. Raise it
+  # deliberately, one step at a time, watching collab_tau_ext for the alternating-sign growth.
+  residual_gain: 20.0
   # Safety velocity-damper parameters (closed-loop dynamics constraint).
-  vel_damper_m: 1.2
+  # 1.8 is the C++ default and therefore what has actually been running; the file said 1.2,
+  # which never took effect. Same reasoning as residual_gain above — change it on purpose.
+  vel_damper_m: 1.8
   vel_damper_lambda: 70.0
 
 # No additional text states
