@@ -24,15 +24,22 @@ mkMcRtcController {
       # mc_kinova's topic/add-genA-bota branch, not mc_kinova's plain main).
       MainRobot = "KinovaBotaPegPlate";
     };
-    # Not optional: etc/CollabPegInHoleController.in.yaml's `Plugins: [RosForceSensor,
-    # ExternalForcesEstimator]` is loaded unconditionally at startup, and mc_rtc treats a
-    # missing plugin as a critical error. Picked up by mc-rtc-nix's mkControllerSuperbuild via
-    # convertListToDrvsStrict, which resolves these names against the package set assembled
-    # from mc-rtc-kinova-external-forces's `packages` (see that flake's flake.nix).
+    # Not optional: etc/CollabPegInHoleController.in.yaml's `Plugins: [RosForceSensor]` is
+    # loaded unconditionally at startup, and mc_rtc treats a missing plugin as a critical
+    # error. Picked up by mc-rtc-nix's mkControllerSuperbuild via convertListToDrvsStrict,
+    # which resolves these names against the package set assembled from
+    # mc-rtc-kinova-external-forces's `packages` (see that flake's flake.nix).
     plugins = [
       "mc-ros-force-sensor"
-      "mc-residual-estimation"
     ];
+
+    # Also not optional, and for the same reason: the ObserverPipelines block loads an
+    # ExternalForcesObserver unconditionally, and a missing observer is fatal just like a
+    # missing plugin. This is a fork of isri-aist/mc_external_forces_observer adding the
+    # EF_Estimator::getResidualOnly / getFTSensorTorques / getExternalTorques datastore
+    # getters, without which the person-A and person-B channels cannot be logged apart. It
+    # replaces the mc-residual-estimation plugin that used to provide this.
+    observers = [ "mc-external-forces-observer" ];
 
     # Picked up by mc-rtc-nix's mkControllerSuperbuild: with-suggested defaults to true, so
     # these get added to the generated superbuild shell automatically — mc-kinova's
@@ -49,7 +56,7 @@ mkMcRtcController {
     # nix-built copy with no flake edit, no hash, and no rebuild of the nix package.
     devel = {
       robots = [ "mc-kinova" ];
-      plugins = [ "mc-residual-estimation" ];
+      observers = [ "mc-external-forces-observer" ];
     };
   };
 

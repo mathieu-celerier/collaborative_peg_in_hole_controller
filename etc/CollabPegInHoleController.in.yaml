@@ -17,6 +17,16 @@ StatesFiles:
 # If true, state factory will be more verbose
 VerboseStateFactory: false
 
+# Additional robots to load.
+# mc_mujoco builds its scene out of the mc_rtc robots it is handed, one
+# share/mc_mujoco/<module>.yaml each. The checker floor AND the <visual> headlight/ambient
+# override both live in mc_mujoco's separate `ground` module (share/mc_mujoco/env/ground.xml);
+# without this entry that module is never loaded, so the scene has no floor and falls back to
+# MuJoCo's default lighting plus the single trackcom point light in the robot XML.
+robots:
+  ground:
+    module: env/ground
+
 # Collision constraint (self-collisions, minimal set)
 collisions:
   - type: collision
@@ -27,22 +37,63 @@ collisions:
 #    It self-gates: it only writes once it receives a message on the sensor topic,
 #    so it feeds the wrench on the real robot (mc_kortex) and is a no-op under
 #    mc_mujoco (where the simulator populates the sensor).
-#  - ExternalForcesEstimator provides the joint-torque residual (person A channel).
-Plugins: [RosForceSensor, ExternalForcesEstimator]
+Plugins: [RosForceSensor]
 
-# ExternalForcesEstimator's config override lives in
-# etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml, not here: mc_rtc's
+# RosForceSensor's config override lives in
+# etc/CollabPegInHoleController/plugins/RosForceSensor.yaml, not here: mc_rtc's
 # MCGlobalController::GlobalConfiguration::load_controller_plugin_configs() only reads a
 # per-controller plugin override from that dedicated path (etc/<Controller>/plugins/<Plugin>.yaml
-# under the controller's own install prefix) - a top-level `ExternalForcesEstimator:` key in
-# this file is never read for plugin init.
+# under the controller's own install prefix) - a top-level `RosForceSensor:` key in this file is
+# never read for plugin init. Observers are configured inline below instead, which is one reason
+# the estimator is easier to live with now that it is one.
 
-# Encoder observer pipeline (needed for the residual / feedback).
+# Observer pipeline.
+#  - Encoder supplies the joint velocities the momentum observer integrates against; without it
+#    ExternalForcesObserver logs a warning every tick and returns zero.
+#  - ExternalForcesObserver replaces the ExternalForcesEstimator *global plugin* that used to
+#    provide the person-A channel. Same datastore prefix (EF_Estimator::), same
+#    setExternalTorques feedback into the QP, but it is an observer, so its configuration lives
+#    here rather than in a separate plugin override file.
 ObserverPipelines:
   - name: Pipeline
+    gui: true
+    log: true
     observers:
       - type: Encoder
         velocity: encoderVelocities
+      - type: ExternalForcesObserver
+        estimation_method: MomentumObserver
+        # The controller drives feedback per state (setEstimatorActive): Initial turns it off,
+        # Compliant turns it on. Start matching Initial so homing is never fed external torques.
+        is_active: false
+        # With this on, the force-sensor torques enter the momentum observer's integral as a
+        # KNOWN input, so the residual it reports is the unexplained remainder - person A with
+        # person B already subtracted. That is exactly the channel separation this controller
+        # wants, and it is why collab_residual now means something narrower than it used to.
+        #
+        # This REQUIRES the force sensor's gravity calibration to be loaded. Without it
+        # wrenchWithoutGravity() returns the raw reading, the plate's own 6.5 N of weight is
+        # projected in as a phantom external force, and switching to Compliant steps the QP's
+        # external torque by ~4 Nm in one tick (the observer reset zeroes the residual that had
+        # been silently cancelling the phantom) - which blows the arm up. See mc_kinova's
+        # calib/README.md; check collab_ft_wrench_norm_nograv reads ~0 at rest, not ~6.6.
+        use_forces_from_ft_sensors: true
+        residual_gain: 20.0
+        # Measured joint torque rather than the QP's commanded torque. Two reasons: it takes the
+        # QP command out of the estimation loop, so the observer compares what the joints
+        # actually did against the model instead of against what the solver asked for; and it is
+        # the mode upstream recommends wherever joint-side torque sensing exists, which the
+        # Kinova has. In this mode the observer also removes rotor inertia from M (M -= HIr()),
+        # so the residual's scale and noise differ from the CommandedTorque path - residual_gain
+        # above is worth re-checking after this change.
+        #
+        # Caveat: the torque sensors sit after the harmonic drive, so joint friction is not
+        # rejected and lands in the residual, i.e. in person A's channel.
+        torque_source_type: JointTorqueMeasurement
+        # NOTE: unlike the old plugin, the observer has no `ft_sensor_name` key - it projects
+        # EVERY force sensor on the robot through J^T. That is equivalent here only as long as
+        # KinovaBotaPegPlate exposes EEForceSensor alone; a second sensor would silently join
+        # the estimate.
 
 # Per-robot configuration (keyed by robot module name).
 # Keyed on robot().module().name, which is the snake_case *variant* string built by
@@ -59,7 +110,7 @@ kinova_bota_peg_plate:
   #  external = full external wrench reconstructed from the estimator's external joint
   #             torques (residual fused with the F/T sensor). Sees BOTH the person guiding
   #             the arm behind the sensor AND the person moving the plate. Requires the
-  #             ExternalForcesEstimator plugin to be loaded and active.
+  #             ExternalForcesObserver to be in the pipeline and active.
   #  ft       = F/T sensor only (plate/person B only) - the previous behaviour.
   trigger_source: external
   # Trigger wrench-norm thresholds (hysteresis): free the end-effector above 'enter',
@@ -74,21 +125,141 @@ kinova_bota_peg_plate:
   ee_hold_stiffness: 400.0 # stiffness while holding position
   ee_hold_damping: 40.0 # damping while holding position (ramp target)
   ee_free_damping: 15.0 # damping while freed (stiffness 0) on contact
+  # Orientation while the end-effector is freed. Level or free used to be the choice; it is
+  # not any more, because the two are not the same number of constraints.
+  #
+  # Defending a pose was tried -- gains pinned at 400 on a latched target -- and it does not
+  # work at this posture, measured over three episodes each:
+  #
+  #   orientation      | posture damping | tool swing  | closest approach | QP
+  #   -----------------+-----------------+-------------+------------------+--------
+  #   compliant        | 2 (default)     |  46-53 deg  |  2.0-2.6 mm      | ok
+  #   pose defended    | 2, 10, 20, 30   |     --      |      --          | FAILS
+  #   pose defended    | 40              | 0.4-2.0 deg |  73-77 mm        | ok
+  #
+  # Below 40 the arm's internal motion runs away -- joints 1 and 3 counter-rotate while
+  # q0 + q2 stays put -- and the QP reports its constraints inconsistent. At 40 it is stable
+  # and level, and the partners can no longer move the plate. Raising their authority does not
+  # help: the M3 Nash stiffness is 105 N/m whatever plant damping it is solved against.
+  #
+  # So orientation stays compliant, which is the only setting that has ever produced usable
+  # demonstrations on this arm.
+  #
+  # That table predates the low-pass on tau_ext (external_torque_filter_hz). What actually
+  # broke `false` was not the withheld angular feed-forward but the unfiltered estimate behind
+  # it: holding the orientation means commanding torque against tau_ext, that torque accelerates
+  # the plate, and the plate's inertial reaction IS most of tau_ext -- a loop that closes inside
+  # one tick. Measured on the 19:30 run: steady ~12 N from the operator, flat for seconds, then
+  # at the free edge joints 1, 5 and 7 (the rotations about the vertical -- exactly the axes
+  # being defended) ring at ~90 Hz growing 3x per cycle while the tool travels 1.3 mm and the
+  # sensor swings +45 to -77 N. The residual channel stayed at ~0.02 N.m: none of it was person
+  # A, and none of it was the operator.
+  #
+  # So `false` is the setting to run, and the filter is what pays for it. If it rings again,
+  # lower external_torque_filter_hz before touching this.
+  ee_orientation_compliant: false
+
+  # --- Up-vector task: implemented, and it does not work yet. OFF by default. ---
+  #
+  # The idea, taken from box_carying_demo_controller's Compliance state: stop asking for three
+  # angular constraints. A VectorOrientationTask holds the tool's up axis vertical -- two
+  # constraints -- and leaves the spin about that axis to the partners, so the plate stays
+  # level while the dyad keeps the freedom it needs.
+  #
+  # Measured 2026-08-20, three episodes per setting, on top of the table above:
+  #
+  #   up stiffness / weight | posture damping | posture stiffness | 6d ori weight | result
+  #   ----------------------+-----------------+-------------------+---------------+-----------
+  #    10 /  1000           | 2               | 0                 | 10000         | tilt 47 deg
+  #    10 /  5000           | 2               | 0                 | 10000         | QLD 144
+  #    30 /  5000           | 2               | 0                 | 10000         | QLD 144
+  #    30 /  5000           | 10              | 0                 | 10000         | QLD 144
+  #    30 /  5000           | 2               | 0                 | 10000 (ff off) | QLD 144
+  #    30 /  5000           | 4               | 10                | 10000         | QLD 144
+  #    30 /  5000           | 2               | 0                 | 1             | QLD 142
+  #   100 / 20000           | 2               | 0                 | 10000         | QLD 144
+  #
+  # Weight is the knob that decides it, not stiffness: at 1000 the task is too weak to change
+  # the 47 deg swing at all, and by 5000 the QP is gone. Nothing found so far opens a window
+  # between the two -- not posture damping, not posture stiffness (the anchor the box demo
+  # has and this controller does not), not withholding the angular feed-forward, and not
+  # handing rotation to the up-vector task alone by dropping the 6d task's angular weight.
+  #
+  # What is different about the box demo, and the next thing to try: it never lets the
+  # end-effector go limp. Its position task keeps stiffness 100 except on the two axes being
+  # pushed, and its orientation task keeps stiffness 100 except about the vertical. This
+  # controller ramps all six axes to zero stiffness when the plate is freed, and adds an
+  # angular objective to an arm that is holding nothing.
+  ee_up_vector_enabled: false
+  ee_up_vector_stiffness: 30.0
+  ee_up_vector_weight: 5000.0
+  # Weight of the 6d task's orientation sub-task while the up-vector task is active. Negative
+  # keeps ee_task_weight.
+  ee_orientation_weight: -1.0
   ee_task_weight: 10000.0 # end-effector task weight
   # Posture task tuning.
-  initial_posture_stiffness: 0.5 # posture stiffness in the Initial state
+  initial_posture_stiffness: 0.5 # only used when homing_duration <= 0 (step homing)
+  # Homing rides a joint-space minimum-jerk trajectory to initial_posture instead of stepping
+  # to it. A step forces a choice between gains too soft to arrive -- the arm was still 100 mm
+  # low when the next episode started, and every episode after the first began from that drift
+  # -- and gains stiff enough to lunge, because a step asks for infinite velocity. An
+  # interpolated reference has bounded velocity and acceleration of its own, so the gain only
+  # has to track it, which is why this stiffness can be 20x the step one.
+  # Keep the duration under the episode driver's home_time (3 s) or the next episode starts
+  # mid-ride.
+  homing_duration: 2.5
+  homing_posture_stiffness: 10.0
+  # Damps the arm's internal motion, which nothing else does once the end-effector is freed:
+  # joints 1 and 3 are nearly parallel at this posture, so the arm has an internal
+  # configuration the tool task can barely see. 2.0 is enough while the orientation is
+  # compliant and nowhere near enough once it is held -- see ee_orientation_compliant. It is
+  # also the only knob found to stop that runaway, and it is blunt: it damps the motion the
+  # task needs just as much as the motion it is meant to suppress.
   posture_compliant_damping: 2.0 # posture damping in the Compliant state
-  # ExternalForcesEstimator residual gain (person A responsiveness).
-  # 20.0 = COLLAB_HIGH_RESIDUAL_GAIN, the value that has actually been running all along while
-  # this block was dead. The file previously said 30.0; that was never in effect, so adopting it
-  # here would be a 50% gain increase on a loop that has only just been stabilised. Raise it
-  # deliberately, one step at a time, watching collab_tau_ext for the alternating-sign growth.
+  # Posture stiffness in the Compliant state. Damping alone holds the internal configuration
+  # while nothing acts on the plate's rotation; it does not once the up-vector task does, and
+  # the QP reports its constraints inconsistent. box_carying_demo_controller anchors its null
+  # space with posture stiffness 10 against an end-effector task of the same weight as ours.
+  posture_compliant_stiffness: 0.0
+  # Observer residual gain (person A responsiveness), pushed at state entry via
+  # EF_Estimator::setGain, so it overrides the pipeline value above.
+  #
+  # 20.0 carries over from the ExternalForcesEstimator plugin, but it is NOT the same quantity.
+  # The plugin low-passed the F/T torques with time constant 1/residual_gain and added the
+  # high-passed remainder to the residual, so the gain set the crossover of a complementary
+  # filter. The observer feeds those torques straight into the momentum integral, so the gain
+  # is only the observer bandwidth. Treat 20.0 as a starting point to re-tune, not as a
+  # validated value: raise it one step at a time, watching collab_tau_ext for alternating-sign
+  # growth.
   residual_gain: 20.0
   # Safety velocity-damper parameters (closed-loop dynamics constraint).
   # 1.8 is the C++ default and therefore what has actually been running; the file said 1.2,
   # which never took effect. Same reasoning as residual_gain above — change it on purpose.
   vel_damper_m: 1.8
   vel_damper_lambda: 70.0
+  # Saturation of the estimator's external joint torques, as a fraction of each joint's torque
+  # limit. This is a feasibility guard, not a filter: the dynamics constraint takes tau_ext as a
+  # known term of `H qdd + C = tau + tau_ext` with |tau| bounded, so an estimate the motors
+  # cannot oppose leaves the constraint set EMPTY - QLD reports "constraints inconsistent", the
+  # QP emits no command, and the simulator integrates garbage (`Nan, Inf or huge value in QACC`).
+  # The wrist makes this cheap to hit: joints 5-7 are limited to 9 N.m against 39 N.m for joints
+  # 1-4, so ~30 N on the plate at ~0.3 m already outruns joint_5. Set <= 0 to disable.
+  # Watch collab_tau_ext_clamped_dofs: a nonzero value means the push is beyond the arm's
+  # authority and the estimate is being trimmed, so the reported wrench understates reality.
+  max_external_torque_ratio: 0.7
+  # Cutoff of the first-order low-pass applied to tau_ext on its way into the solver (Hz).
+  # <= 0 disables it.
+  #
+  # This is what makes a freed end-effector stable, and it is not optional at 1 kHz. The F/T
+  # sensor reads the reaction of everything distal to it and wrenchWithoutGravity() removes
+  # gravity, not inertia; the plate's CoM is 139 mm off the sensor, so tool angular acceleration
+  # appears as ~0.095*alpha newtons of pure artefact. The compliant task feeds tau_ext straight
+  # back as commanded acceleration, so sensor -> estimate -> command -> motion -> sensor closes
+  # algebraically inside one tick, and once the stiffness ramps down nothing dissipates it.
+  # Measured: the tool moved 1.3 mm while the sensor swung +45 to -77 N, ~90 Hz, growing 3x per
+  # cycle. A person guiding an arm lives below ~5 Hz, so 10 Hz keeps the human channel and
+  # removes an order of magnitude at the ring. Raise it and the arm feels quicker until it rings.
+  external_torque_filter_hz: 10.0
 
 # No additional text states
 states: {}

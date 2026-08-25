@@ -1,0 +1,18 @@
+# Default (inert) configuration for the SimHumanPartner plugin.
+#
+# The real configuration is GENERATED, not written by hand: run
+#   python scripts/make_sim_config.py
+# in the learning repo (~/devel/learning-based-collaborative-peg-in-hole) and install the
+# result as etc/CollabPegInHoleController/plugins/SimHumanPartner.yaml, where mc_rtc reads
+# per-controller plugin overrides.
+#
+# The gains it emits are derived rather than tuned -- for an M3 partner they are the Nash
+# equilibrium of a two-player differential game -- so editing them here silently decouples
+# them from the model that justified them.
+#
+# This file exists only so the plugin has something to load if it is enabled without a
+# generated config. It deliberately has no partners, which makes the plugin throw with an
+# explanatory message rather than quietly applying nothing.
+enabled: true
+auto_episodes: false
+partners: []

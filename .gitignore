@@ -1,3 +1,6 @@
 build*
 .superbuild/
 .direnv/
+
+# mc_mujoco drops this wherever it is launched from.
+MUJOCO_LOG.TXT

@@ -1,6 +1,6 @@
-set(controller_SRC CollabPegInHoleController.cpp)
+set(controller_SRC CollabPegInHoleController.cpp PolicyPartner.cpp)
 
-set(controller_HDR CollabPegInHoleController.h)
+set(controller_HDR CollabPegInHoleController.h PolicyPartner.h)
 
 add_library(${PROJECT_NAME} SHARED ${controller_SRC} ${controller_HDR})
 set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS

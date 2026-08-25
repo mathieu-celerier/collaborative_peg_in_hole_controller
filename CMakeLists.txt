@@ -20,6 +20,11 @@ endif()
 
 add_subdirectory(src)
 
+# Simulation-only: applies the simulated human partners as external wrenches in mc_mujoco.
+# Built unconditionally (it is inert without mc_mujoco's ApplyWrenchOnBody datastore call)
+# but never loaded on hardware -- Plugins in etc/CollabPegInHoleController.yaml decides.
+add_subdirectory(plugins/SimHumanPartner)
+
 if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
@@ -32,6 +37,5 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/etc/CollabPegInHoleController.yaml"
 # Per-controller plugin config override, read by mc_rtc from
 # etc/CollabPegInHoleController/plugins/<Plugin>.yaml under this install prefix (see
 # MCGlobalController::GlobalConfiguration::load_controller_plugin_configs()).
-install(FILES "etc/CollabPegInHoleController/plugins/ExternalForcesEstimator.yaml"
-              "etc/CollabPegInHoleController/plugins/RosForceSensor.yaml"
+install(FILES "etc/CollabPegInHoleController/plugins/RosForceSensor.yaml"
         DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc/CollabPegInHoleController/plugins")

@@ -5,7 +5,7 @@
 # mc-ros-force-sensor is pinned to topic/new-implementation rather than main, because only that
 # branch guards the sensor write with `if(!data.isValid()) return;`. Without it the plugin
 # overwrites EEForceSensor with a zero wrench on every tick whenever nothing publishes on the
-# topic - which is every mc_mujoco run - starving the ExternalForcesEstimator's F/T fusion and
+# topic - which is every mc_mujoco run - starving the ExternalForcesObserver's F/T fusion and
 # destabilising the compliance loop.
 #
 # That branch is divergent from main and predates "Update default config for new bota driver",

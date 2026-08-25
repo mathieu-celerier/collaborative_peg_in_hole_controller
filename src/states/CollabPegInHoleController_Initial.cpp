@@ -13,7 +13,7 @@ void CollabPegInHoleController_Initial::start(mc_control::fsm::Controller & ctl_
 bool CollabPegInHoleController_Initial::run(mc_control::fsm::Controller & ctl_)
 {
   auto & ctl = static_cast<CollabPegInHoleController &>(ctl_);
-  if(ctl.requestedState() == "Compliant")
+  if(ctl.requestedState() == "Compliant" && !ctl.homing())
   {
     output("GoToCompliant");
     return true;

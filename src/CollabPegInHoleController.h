@@ -3,9 +3,11 @@
 #include <mc_control/fsm/Controller.h>
 #include <mc_tasks/CompliantEndEffectorTask.h>
 #include <mc_tasks/CompliantPostureTask.h>
+#include <mc_tasks/VectorOrientationTask.h>
 
 #include <RBDyn/Jacobian.h>
 
+#include "PolicyPartner.h"
 #include "api.h"
 
 #include <deque>
@@ -14,7 +16,7 @@
 #include <string>
 #include <vector>
 
-// Residual gains fed to the ExternalForcesEstimator plugin. The residual is the
+// Residual gains fed to the ExternalForcesObserver. The residual is the
 // only observable channel for the person manipulating the arm *behind* the F/T
 // sensor (person A); a high gain makes hand-guiding responsive.
 #define COLLAB_HIGH_RESIDUAL_GAIN 20.0
@@ -30,7 +32,7 @@
  * The controller separates the two human interaction channels so both can be
  * recorded for imitation learning:
  *  - Person A (arm, before the F/T sensor): observed via the joint-torque
- *    residual of the ExternalForcesEstimator plugin.
+ *    residual of the ExternalForcesObserver.
  *  - Person B (peg piece, after the F/T sensor): observed via the F/T sensor
  *    wrench (EEForceSensor).
  */
@@ -63,20 +65,119 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   void updateDualCompliance();
   /** Reset the end-effector task to its stiff "hold" configuration. */
   void holdEndEffector();
+  /** Angle between the tool's up axis and world vertical, in radians. */
+  double toolTilt() const;
+  /** Apply the end-effector compliance for the current free/hold state.
+   *
+   * Compliance is per-axis, and translation and orientation are not treated alike: see
+   * `eeOrientationCompliant_`. */
+  void applyEECompliance(bool free);
 
-  /** Episode markers for dataset segmentation. */
+  /** Episode markers for dataset segmentation.
+   *
+   * An episode is one recorded demonstration, delimited inside the session log by the
+   * `collab_recording` marker. `startEpisode()` opens it, `markEpisode()` attaches a
+   * *sticky* outcome that covers the whole episode, `stopEpisode()` closes it. The extractor
+   * (`scripts/extract_episodes.py`) segments on the `collab_recording` edges and reads
+   * `collab_episode_outcome` to filter successful demonstrations. */
   void startEpisode();
   void markEpisode(const std::string & label);
   void stopEpisode();
+
+  /** Evaluate the behaviour-cloned partner and inject its force at the task level.
+   *
+   * Called once per tick from run(), ahead of the FSM, so `policyWrenchNorm_` is fresh when
+   * updateDualCompliance() reads it in the same tick.
+   *
+   * The force does NOT act on the robot. It is converted to a task-frame acceleration and
+   * handed to compEETask->refAccel(), which is where the demonstrating partner's force
+   * arrived from: CompliantEndEffectorTask::update() computes
+   *
+   *     disturbedAccel_ = refAccel_ + Gamma * (J * H^-1 * tau_ext)
+   *
+   * so `refAccel_` is the free feed-forward slot beside the estimator's disturbance term.
+   * Two consequences that are easy to get wrong and silent when you do:
+   *
+   * - **Gamma is not applied to refAccel_.** It scales the disturbance term only, so this
+   *   applies it by hand. Skip that and the policy drives the angular axes even when
+   *   `ee_orientation_compliant` is false, quietly undoing the choice to keep the plate
+   *   level while the translation floats.
+   * - **The route is through joint space.** J_A^T at person A's contact point, then H^-1,
+   *   then the tool Jacobian. That is what makes a pure force at an offset point produce
+   *   the right angular term at the tool frame; a direct task-space conversion loses it.
+   */
+  void updatePolicyPartner();
+
+  /** The observation the policy takes, in cpih.policy.features order.
+   *
+   * Mirrors `cpih.policy.features.FEATURES` exactly, and `policyFeatureNames()` is checked
+   * against the names in the policy file at load time. Note that `q`/`dq` are the *encoder*
+   * channels, because the dataset's obs/q and obs/dq are qIn and alphaIn -- feeding the
+   * control robot's mbc here would be a different signal wearing the same name.
+   */
+  Eigen::VectorXd policyFeatures() const;
+  static std::vector<std::string> policyFeatureNames(bool withPhase);
 
   // Frames / sensors (configurable per robot module).
   std::string tool_frame;
   std::string ft_sensor;
   std::string insertion_frame;
 
+  // --- Behaviour-cloned partner (replaces person A) ---
+  collab::PolicyPartner policy_;
+  bool policyEnabled_ = false;
+  std::string policyPath_;
+  /** Where the peg is, world frame. Scene knowledge the controller has no other source for.
+   * In simulation the plugin knows it and logs it; here it is configured, which is also how
+   * it would arrive on the real robot (from calibration or perception). */
+  Eigen::Vector3d pegTarget_ = Eigen::Vector3d::Zero();
+  bool havePegTarget_ = false;
+  /** Person A's contact point: the body they pushed on and where. Must match the partner
+   * entry the demonstrations were generated with, or the Jacobian is the wrong one. */
+  std::string policyBody_ = "end_effector_link";
+  Eigen::Vector3d policyPoint_ = Eigen::Vector3d::Zero();
+  /** The policy is trained at the dataset rate (100 Hz), not the control rate. Evaluate it
+   * every `policyDecimation_` ticks and hold the force between: it matches the rate the map
+   * was fitted at, and costs a tenth of the inference. */
+  int policyDecimation_ = 10;
+  int policyTick_ = 0;
+  Eigen::Vector3d policyForce_ = Eigen::Vector3d::Zero();
+  Eigen::Vector6d policyAccel_ = Eigen::Vector6d::Zero();
+  /** The policy's contribution to the free/hold trigger. The policy stays out of
+   * externalTorques() -- that is the estimate of what the world does, and the policy is not
+   * the world -- but the trigger has to see it, or the end-effector re-latches earlier than
+   * it did in the demonstrations, where person A's real force fed the same trigger. */
+  double policyWrenchNorm_ = 0.0;
+  /** Hole position one policy step ago, for the finite difference. The features use a
+   * difference over the policy interval, not frame().velocity(): the dataset's velocity is a
+   * difference at 100 Hz, and a feed-forward term is not the place to spend that mismatch. */
+  Eigen::Vector3d lastHole_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d holeVelocity_ = Eigen::Vector3d::Zero();
+  bool haveLastHole_ = false;
+  /** Jacobian at person A's contact point, built once. Constructing an rbd::Jacobian
+   * allocates, and this runs on the control thread. */
+  std::unique_ptr<rbd::Jacobian> policyJac_;
+
   // Explicit-compliance tasks.
   std::shared_ptr<mc_tasks::CompliantPostureTask> compPostureTask;
   std::shared_ptr<mc_tasks::CompliantEndEffectorTask> compEETask;
+
+  /** Keeps the tool pointing up while leaving rotation about the vertical free.
+   *
+   * A VectorOrientationTask constrains two rotational degrees of freedom, not three: it
+   * aligns one frame-fixed vector with a world direction and says nothing about the spin
+   * around it. That is exactly the split this task needs -- the plate must stay level for
+   * the peg to enter the hole, but which way it faces around the vertical is the dyad's
+   * business. Defending the full orientation instead is what made the QP report its
+   * constraints inconsistent; see `eeOrientationCompliant_`. Modelled on the up-vector task
+   * in box_carying_demo_controller's Compliance state. */
+  std::shared_ptr<mc_tasks::VectorOrientationTask> eeUpVectorTask;
+
+  /** Still riding the homing trajectory. The Initial state must not hand over while true:
+   * the episode driver asks for Compliant as soon as it can, and leaving mid-ride puts the
+   * arm into the compliant state from a configuration that is neither home nor the one the
+   * gains were checked at. */
+  bool homing() const { return homing_; }
 
   // Home posture (per-robot, from config).
   std::map<std::string, std::vector<double>> postureHome;
@@ -84,19 +185,37 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
 private:
   void addGui();
   void addLog();
-  // Toggle the ExternalForcesEstimator feedback on/off if the plugin is loaded.
+  /** Swap in mc_kinova's simulation F/T calibration when running under mc_mujoco.
+   *
+   * The robot's calibration folds in the Bota's force gain and its home-pose tare; the
+   * simulated sensor is exact and untared, so applied there it compensates almost nothing.
+   * No-op on hardware. Called from reset(), which is late enough for mc_mujoco's datastore
+   * calls to exist. */
+  void applySimForceSensorCalibration();
+
+  /** Shape the estimator's external joint torques on the way into the solver: low-pass, then
+   * saturate, on both robot() and realRobot(). Logged and recorded signals are read before this
+   * runs, so it changes what the QP acts on and nothing else. */
+  void conditionExternalTorques();
+  // Toggle the ExternalForcesObserver feedback on/off if the observer is in the pipeline.
   void setEstimatorActive(bool active);
   bool estimatorAvailable() const;
   // Read an Eigen vector from the datastore if present, else a zero vector.
   Eigen::VectorXd datastoreVector(const std::string & key, Eigen::Index size) const;
   // Running-average helper (bounded window), cf. box_carying_demo_controller.
   static void updateSlidingAverage(std::deque<double> & history, double & sum, double value, std::size_t maxSamples);
-  /** Task-space external wrench at tool_frame, reconstructed from the estimator's full
-   * external joint torques (residual fused with the F/T sensor). This is the only signal
-   * that sees BOTH people: person A pushing the arm (residual only) and person B pushing
-   * the plate (F/T). Mirrors the plugin's own J^T pseudo-inverse conversion, cf.
-   * mc_residual_estimation FixedBaseEstimatorBackend::computeFixedBaseForceFusion. */
+  /** Task-space wrench at tool_frame corresponding to a vector of external joint torques,
+   * by least-squares inversion of tau = J^T w, expressed in world. */
+  sva::ForceVecd wrenchFromTorques(const Eigen::VectorXd & tau) const;
+  /** Task-space external wrench at tool_frame, from the observer's full external joint
+   * torques (residual + F/T projection). This is the only signal that sees BOTH people:
+   * person A pushing the arm and person B pushing the plate. It drives the free/hold
+   * trigger and the compliant task's feed-forward. */
   sva::ForceVecd computeExternalWrench();
+  /** Same conversion applied to the momentum residual alone - person A, with person B already
+   * subtracted by the observer's known-input fusion. Logged only: it is what tells you which
+   * of the two people an angular term that runs away belongs to. */
+  sva::ForceVecd computeResidualWrench() const;
 
   mc_rtc::Configuration config_;
 
@@ -106,10 +225,41 @@ private:
   bool eeInSolver_ = false;
 
   // Tuning parameters (all overridable from the per-robot config block).
-  double residualGain_ = COLLAB_HIGH_RESIDUAL_GAIN; // ExternalForcesEstimator residual gain
+  double residualGain_ = COLLAB_HIGH_RESIDUAL_GAIN; // ExternalForcesObserver residual gain
   double eeTaskWeight_ = 10000.0; // end-effector task weight
   double postureCompliantDamping_ = 2.0; // posture damping in the compliant state
-  double initialPostureStiffness_ = 0.5; // posture stiffness in the initial state
+  /** Posture stiffness in the Compliant state. Zero leaves the arm's internal configuration
+   * held by damping alone, which is enough while nothing else acts on the rotation but not
+   * once a task defends the plate's tilt: two angular objectives on a limp arm is what makes
+   * the QP report its constraints inconsistent. box_carying_demo_controller anchors its null
+   * space the same way, with posture stiffness 10 against an end-effector task of the same
+   * weight as ours. */
+  double postureCompliantStiffness_ = 0.0;
+  double initialPostureStiffness_ = 0.5; // posture stiffness if homing is disabled
+
+  /** Homing: a joint-space minimum-jerk ride to `postureHome`, not a step target.
+   *
+   * Homing used to be one step -- set the target to the home posture and let a soft posture
+   * task walk there -- and the arm did not arrive: at a stiffness low enough that the step
+   * does not fling it, the residual error never closes inside the time the episode driver
+   * waits, so episode 2 started 100 mm below where episode 1 did and the dataset recorded the
+   * drift as if it were part of the task. Raising the stiffness instead trades that for a
+   * lunge, because a step target asks for infinite velocity and only the gain limits it.
+   *
+   * Interpolating the target removes the choice: the reference itself has bounded velocity
+   * and acceleration (zero at both ends), so the stiffness only has to *track* it. That is
+   * what lets it be an order of magnitude higher than the step version could afford. */
+  double homingDuration_ = 2.5;          // s; <= 0 restores the old step behaviour
+  double homingPostureStiffness_ = 10.0; // stiffness while riding the trajectory
+  bool homing_ = false;
+  double homingTime_ = 0.0;
+  std::map<std::string, std::vector<double>> homingStart_;
+  /** Latch the current posture and start the ride to `postureHome`. */
+  void startHoming();
+  /** Advance the ride by one control cycle. No-op unless homing. */
+  void updateHoming();
+  /** Drop the homing feed-forward, so no state after homing inherits a reference velocity. */
+  void clearHomingRefs();
 
   // Dual-compliance (force-triggered EE freeing) parameters and state.
   double dualForceEnter_ = 5.0; // wrench norm (N / Nm) above which the EE frees up
@@ -117,6 +267,42 @@ private:
   double eeHoldStiffness_ = 400.0; // stiffness when holding position
   double eeHoldDamping_ = 40.0; // damping when holding position (ramp target)
   double eeFreeDamping_ = 15.0; // damping when free (stiffness 0)
+  /** Whether freeing the end-effector also frees the plate's orientation in the 6d task.
+   *
+   * The default matches the shipped yaml, which is false. It used to be true, justified by
+   * `eeUpVectorTask` holding the tool's up axis vertical so the 6d task could hand the whole
+   * rotation to the partners and the plate would still stay level -- but that task is off
+   * (`ee_up_vector_enabled: false`, and the measurements behind that are tabulated in
+   * etc/CollabPegInHoleController.in.yaml), so the justification no longer applies.
+   *
+   * False is the setting to run, and it needs conditionExternalTorques()'s low-pass to be
+   * stable. Holding the orientation means commanding torque against tau_ext; that torque
+   * accelerates the plate; and the plate's inertial reaction is most of what the F/T sensor
+   * reports, so the loop closes inside one tick. Measured (19:30 run, 2026-08-24): a steady
+   * ~12 N from the operator, flat for seconds, then at the free edge joints 1, 5 and 7 -- the
+   * rotations about the vertical, i.e. exactly the defended axes -- ring at ~90 Hz growing ~3x
+   * per cycle while the tool travels 1.3 mm and the sensor swings +45 to -77 N; QP infeasible
+   * 26 ms later. tauMomentumObserver stayed at ~0.02 N.m throughout, so none of it was person A
+   * and none of it was the operator -- which is why this only ever appeared with
+   * use_forces_from_ft_sensors: true and looked like the calibration bug.
+   *
+   * What is settled: defending a pose in the 6d task does not work here either. The full
+   * orientation is three constraints, and pinning all three at a posture where joints 1 and 3
+   * are nearly parallel makes the QP report its constraints inconsistent. */
+  bool eeOrientationCompliant_ = false;
+  // The up-vector task. Off by default: every strength that actually holds the tilt takes the
+  // QP with it, on an arm whose end-effector is ramped to zero stiffness while free. The
+  // measurements are tabulated in etc/CollabPegInHoleController.in.yaml.
+  bool eeUpVectorEnabled_ = false;
+  /** Weight of the 6d task's orientation sub-task while the up-vector task is active.
+   *
+   * Two tasks pulling on the same frame's rotation at comparable weights is not a hierarchy,
+   * it is a fight, and the QP loses it. Dropping the 6d task's angular weight leaves the
+   * up-vector task as the only angular objective; translation keeps the full weight. */
+  double eeOrientationWeight_ = -1.0; // < 0 : keep eeTaskWeight_
+  double eeUpVectorStiffness_ = 100.0;
+  double eeUpVectorWeight_ = 20000.0;
+  Eigen::Vector3d eeUpVectorInTool_ = Eigen::Vector3d::UnitZ(); // latched on entering Compliant
   bool dualFree_ = false; // currently in the free (low-stiffness) mode
   double currentWrenchNorm_ = 0.0; // raw trigger input (norm of the selected source)
 
@@ -124,7 +310,7 @@ private:
   std::string triggerSource_ = "external";
   std::unique_ptr<rbd::Jacobian> extWrenchJac_; // Jacobian at tool_frame, built once
   sva::ForceVecd externalWrench_ = sva::ForceVecd::Zero(); // last reconstructed external wrench
-  bool warnedExtTorqueSize_ = false;
+  mutable bool warnedExtTorqueSize_ = false; // set from the const wrenchFromTorques()
 
   // Anti-chatter smoothing of the free/hold trigger, cf. box_carying_demo_controller.
   double wrenchFilterTime_ = 0.1; // first-order low-pass time constant on the wrench norm
@@ -144,12 +330,29 @@ private:
   int zeroWrenchTicks_ = 0; // consecutive ticks with an exactly-zero wrench
 
   // Velocity-damper (safety) parameters, cf. monodzukuri_controller.
+  // External-torque saturation (see conditionExternalTorques()): the estimate is fed to the QP as a
+  // known term of the dynamics equality, so one larger than the motors can oppose empties the
+  // constraint set. Bound it to this fraction of each joint's torque limit; <= 0 disables.
+  double extTorqueRatio_ = 0.7;
+  Eigen::VectorXd extTorqueLimit_; // per-dof min(|tl|, |tu|), built once
+  // Cutoff of the first-order low-pass on tau_ext into the solver. The sensor->estimate->
+  // command->motion loop closes within one tick through the payload's inertia and rings at
+  // ~90 Hz; a human guiding the arm lives below ~5 Hz. <= 0 disables (and brings the ring back).
+  double extTorqueFilterHz_ = 10.0;
+  Eigen::VectorXd extTorqueFiltered_;
+  int extTorqueClampedDofs_ = 0;
+  bool warnedExtTorqueClamp_ = false;
+
   double m_ = 1.8;
   double lambda_ = 70.0;
   double xsiOff_ = 0.0;
 
   // Episode bookkeeping.
   int episodeId_ = 0;
-  std::string episodeLabel_ = "idle";
+  std::string episodeLabel_ = "idle"; // live label ("idle" / "recording")
+  // Outcome of the current episode ("none" until marked). Sticky: only startEpisode() clears it,
+  // so the label covers every sample of the episode and survives stopEpisode().
+  std::string episodeOutcome_ = "none";
   bool recording_ = false;
+  int episodeTick_ = -1; // samples since the episode started, -1 while idle
 };
