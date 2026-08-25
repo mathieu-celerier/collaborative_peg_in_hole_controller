@@ -289,6 +289,25 @@ private:
   bool haveTarget_ = false;
   double successDepth_ = 0.02;
   double successRadius_ = 0.01; // the hole must be over the peg, not merely below its tip
+  /** Whether meeting the success test ends the episode.
+   *
+   * True is the interactive default, and what every episode used to do. It also censors the
+   * outcome: an episode stopped the instant it is inside the threshold can never report how
+   * much deeper it would have gone, so `success_depth` acts as a stopping rule rather than a
+   * measurement and a batch saturates at whatever fraction of the dyads clear it. With this
+   * false the episode runs to `episode_duration` whatever happens, `seatedDepth_` below is
+   * the graded outcome, and the threshold can be re-chosen afterwards from the recording
+   * instead of being fixed before it. */
+  bool stopOnSuccess_ = true;
+  /** The deepest the hole got *while it was over the peg*, this episode.
+   *
+   * Gated on `lateral < successRadius_` on purpose: a plate that sinks beside the peg
+   * reports a large depth and has inserted nothing, which is the failure the success test's
+   * radius term exists to reject. Stays 0 while the hole has never been over the peg. */
+  double seatedDepth_ = 0.0;
+  double seatedLateral_ = 0.0; // lateral at the tick seatedDepth_ was taken
+  double timeToSeat_ = -1.0;   // s into the episode when the threshold was first met; -1 = never
+  bool everInserted_ = false;  // whether the success predicate ever held this episode
   std::string insertionBody_;   // body carrying the feature being inserted (the tool)
   Eigen::Vector3d insertionPoint_ = Eigen::Vector3d::Zero(); // the hole centre, body frame
   int episodesRequested_ = 0;   // how many still to run; negative means "keep going"

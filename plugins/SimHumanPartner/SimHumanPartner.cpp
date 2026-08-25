@@ -374,6 +374,7 @@ void SimHumanPartner::init(mc_control::MCGlobalController & controller, const mc
   config("episode_duration", episodeDuration_);
   config("success_depth", successDepth_);
   config("success_radius", successRadius_);
+  config("stop_on_success", stopOnSuccess_);
   haveTarget_ = config.has("target");
   config("target", target_);
   config("insertion_body", insertionBody_);
@@ -447,6 +448,10 @@ void SimHumanPartner::reset(mc_control::MCGlobalController & controller)
 {
   t_ = 0.0;
   episodeTime_ = 0.0;
+  seatedDepth_ = 0.0;
+  seatedLateral_ = 0.0;
+  timeToSeat_ = -1.0;
+  everInserted_ = false;
   phase_ = Phase::Idle;
   phaseTime_ = 0.0;
 }
@@ -656,24 +661,46 @@ void SimHumanPartner::updateEpisode(mc_control::MCGlobalController & controller)
       // Both conditions matter. Depth alone would score "the tool sank past the peg tip
       // somewhere else in the workspace" as an insertion, which is how the first version of
       // this test managed to succeed in 0.00 s.
+      // It is a task condition but no longer necessarily a *stopping* condition -- see
+      // stopOnSuccess_ and seatedDepth_ in the header for why the two were separated.
       double lateral = 0.0;
       const double depth = insertionDepth(robot, lateral);
       const bool inserted = lateral < successRadius_ && depth > successDepth_;
-      if(!inserted && episodeTime_ < episodeDuration_)
+
+      // The graded outcome, accumulated every tick rather than sampled at the end. The
+      // deepest sample is not the last one: the dyad can seat the peg and be pushed back
+      // out again by the tail of its own plan, and an episode that stops at the threshold
+      // reports the threshold whatever it was about to do.
+      if(lateral < successRadius_ && depth > seatedDepth_)
+      {
+        seatedDepth_ = depth;
+        seatedLateral_ = lateral;
+      }
+      if(inserted && !everInserted_)
+      {
+        everInserted_ = true;
+        timeToSeat_ = episodeTime_;
+      }
+
+      // With stop_on_success false the episode always runs its full clock, so the outcome
+      // is a threshold on what was recorded rather than the reason the recording stopped.
+      const bool done = (stopOnSuccess_ && inserted) || episodeTime_ >= episodeDuration_;
+      if(!done)
       {
         return;
       }
 
-      collab->markEpisode(inserted ? "success" : "failure");
+      collab->markEpisode(everInserted_ ? "success" : "failure");
       collab->stopEpisode();
       ++episodesCompleted_;
       if(episodesRequested_ > 0)
       {
         --episodesRequested_;
       }
-      mc_rtc::log::info("[SimHumanPartner] episode {} {} after {:.2f} s ({} left)", episodesCompleted_,
-                        inserted ? "succeeded" : "failed", episodeTime_,
-                        episodesRequested_ < 0 ? -1 : episodesRequested_);
+      mc_rtc::log::info(
+          "[SimHumanPartner] episode {} {} after {:.2f} s, seated {:.2f} mm at {:.2f} mm off axis ({} left)",
+          episodesCompleted_, everInserted_ ? "succeeded" : "failed", episodeTime_, seatedDepth_ * 1e3,
+          seatedLateral_ * 1e3, episodesRequested_ < 0 ? -1 : episodesRequested_);
 
       if(!compliantEpisodes_)
       {
@@ -716,6 +743,10 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
   }
   collab.startEpisode();
   episodeTime_ = 0.0;
+  seatedDepth_ = 0.0;
+  seatedLateral_ = 0.0;
+  timeToSeat_ = -1.0;
+  everInserted_ = false;
   phase_ = Phase::Recording;
   phaseTime_ = 0.0;
 }
@@ -741,6 +772,18 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
   logger.addLogEntry("sim_human_target", [this]() -> const Eigen::Vector3d & { return target_; });
   logger.addLogEntry("sim_human_insertion_depth", [this]() { return insertionDepthLog_; });
   logger.addLogEntry("sim_human_insertion_lateral", [this]() { return insertionLateralLog_; });
+  // The graded outcome and its timing. Logged per tick like everything else, so the value at
+  // the episode's last tick is the episode's value -- which is what extract_episodes.py and
+  // run_batch.py both read. Held flat after the peg is seated, deliberately: an episode that
+  // runs on past the insertion must not lose what it achieved.
+  logger.addLogEntry("sim_human_seated_depth", [this]() { return seatedDepth_; });
+  logger.addLogEntry("sim_human_seated_lateral", [this]() { return seatedLateral_; });
+  logger.addLogEntry("sim_human_time_to_seat", [this]() { return timeToSeat_; });
+  // The thresholds this run scored against. Constant for a run, but an episode whose .npz
+  // does not carry them cannot be re-scored at a different depth later, which is the whole
+  // point of recording the seated depth in the first place.
+  logger.addLogEntry("sim_human_success_depth", [this]() { return successDepth_; });
+  logger.addLogEntry("sim_human_success_radius", [this]() { return successRadius_; });
   logger.addLogEntry("sim_human_noise_seed", [this]() { return static_cast<double>(noise_.seed); });
   logger.addLogEntry("sim_human_noise_registration",
                      [this]() -> const Eigen::Vector3d & { return registrationOffset_; });

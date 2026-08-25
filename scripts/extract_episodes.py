@@ -32,6 +32,11 @@ Each output holds, per timestep:
 plus scalar metadata (episode id, outcome, dt, frames, source log) and, when the simulated
 partners were randomised, ``meta/noise/*`` -- the draw that produced this episode. That is
 metadata rather than an observation on purpose: see NOISE_ENTRY.
+
+``meta/seated_depth`` is the graded outcome: how far the peg actually went in, recorded
+whether or not the episode was scored a success. ``outcome`` is a threshold on it
+(``meta/success_depth`` / ``meta/success_radius``, both recorded here for that reason), so a
+batch that saturates can be re-scored rather than re-run.
 """
 
 import argparse
@@ -128,6 +133,19 @@ METADATA_ENTRIES = {
     "residual_gain": "collab_meta_residual_gain",
     "dual_force_enter": "collab_meta_dual_force_enter",
     "dual_force_exit": "collab_meta_dual_force_exit",
+    # The graded outcome, and the thresholds it was scored against. Read at the episode's
+    # last tick like the rest of this table, which is correct because the plugin holds them
+    # flat once set: `seated_depth` is a running maximum and `time_to_seat` is written once.
+    #
+    # These are what make `outcome` re-derivable. An episode run with `stop_on_success:
+    # false` records how deep the dyad actually got, so a batch can be re-scored at a
+    # different depth without re-simulating -- and a dataset whose success rate sits at 97 %
+    # can be looked at again rather than thrown away.
+    "seated_depth": "sim_human_seated_depth",
+    "seated_lateral": "sim_human_seated_lateral",
+    "time_to_seat": "sim_human_time_to_seat",
+    "success_depth": "sim_human_success_depth",
+    "success_radius": "sim_human_success_radius",
 }
 
 
