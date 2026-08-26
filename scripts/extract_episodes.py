@@ -26,6 +26,9 @@ Each output holds, per timestep:
                           channel, person B's F/T channel, tool and insertion poses
   action/q_cmd            commanded joint positions (qOut) -- the demonstrated action
   action/dq_cmd           qOut[k+1] - qOut[k], the same action as a delta
+  target/<partner>_reference  where each partner's plan was asking that hand to be, world
+                          frame -- the intent, and the second candidate action for a policy
+                          (see PARTNER_REFERENCE_ENTRY)
   target/<partner>_force  the world-frame force each simulated partner actually applied
                           (see PARTNER_FORCE_ENTRY) -- the label for a policy that replaces
                           that partner, and never an observation
@@ -114,6 +117,18 @@ NOISE_ENTRY = re.compile(
 # Only available in simulation, which is the only place demonstrations currently come from.
 # A log without the plugin simply has no such entries and the key is absent.
 PARTNER_FORCE_ENTRY = re.compile(r"^sim_human_(.+)_force$")
+
+# The other half of a partner: where its minimum-jerk plan was asking that hand to be, world
+# frame. The force is what the impedance produced from the gap between this and the hand's
+# actual position, so the two together are the whole partner model.
+#
+# Carried because it is a second candidate action for a policy. A policy that predicts the
+# force is a reactive map -- it can follow, but it has nothing to generate a motion from, and
+# measured on the first evaluation it led at 5 % where it followed at 49 %. A policy that
+# predicts the *intent* emits a trajectory instead, and the existing impedance turns that back
+# into a force. It is also the action space RoboManipBaselines takes natively
+# (COMMAND_EEF_POSE), where a wrench action needs its DataKey list patched.
+PARTNER_REFERENCE_ENTRY = re.compile(r"^sim_human_(.+)_reference$")
 
 # Metadata that is a vector rather than a scalar, so it needs `gather` rather than
 # `scalar_metadata`. Constant across an episode, hence metadata and not an observation.
@@ -261,6 +276,18 @@ def partner_force_entries(data):
             continue
         base = key.rsplit("_", 1)[0]
         if PARTNER_FORCE_ENTRY.match(base) and base not in bases:
+            bases.append(base)
+    return bases
+
+
+def partner_reference_entries(data):
+    """The `sim_human_<partner>_reference` entries, discovered the same way."""
+    bases = []
+    for key in data:
+        if not key.startswith("sim_human_"):
+            continue
+        base = key.rsplit("_", 1)[0]
+        if PARTNER_REFERENCE_ENTRY.match(base) and base not in bases:
             bases.append(base)
     return bases
 
@@ -414,6 +441,17 @@ def extract(episode, data, args):
             continue
         name = entry[len("sim_human_") :]
         out["target/" + name] = decimate(values[sl], factor, True)
+        out["columns/" + name] = np.array(columns)
+
+    # Plain striding, unlike the forces: this is a minimum-jerk reference, already smooth by
+    # construction, and averaging it would round the corners of the plan the policy is meant
+    # to reproduce.
+    for entry in partner_reference_entries(data):
+        values, columns = gather(data, entry)
+        if values is None:
+            continue
+        name = entry[len("sim_human_") :]
+        out["target/" + name] = decimate(values[sl], factor, False)
         out["columns/" + name] = np.array(columns)
 
     out["episode_id"] = episode.id
