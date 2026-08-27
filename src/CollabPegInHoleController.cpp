@@ -1079,7 +1079,13 @@ Eigen::Vector3d CollabPegInHoleController::intentForce()
 
 void CollabPegInHoleController::updatePolicyPartner()
 {
-  if(!policyEnabled_ || !policy_ || !eeInSolver_)
+  // `recording_` is the same gate the partner this policy replaces runs behind
+  // (SimHumanPartner::update: `acting = phase == Recording`). Without it the policy starts
+  // pushing the instant the end-effector is freed, while the arm is still at its home pose --
+  // an observation nothing in the training set resembles. The predicted intent is then far
+  // from the hand, person A's 520 N/m spring saturates at its 80 N ceiling immediately, and
+  // the QP dies on the first tick of the Compliant state with "QLD fail code = 144".
+  if(!policyEnabled_ || !policy_ || !eeInSolver_ || !recording_)
   {
     // Zero it rather than leaving it: refAccel_ persists across ticks and compEETask->reset()
     // does not clear it, so a stale feed-forward would keep pushing after the episode.
