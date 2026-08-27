@@ -118,13 +118,70 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   Eigen::VectorXd policyFeatures() const;
   static std::vector<std::string> policyFeatureNames(bool withPhase);
 
+  /** The observation a RoboManipBaselines policy takes: 29 values, RMB's own layout.
+   *
+   * `measured_joint_pos(7) | measured_joint_vel(7) | measured_eef_pose9(9) |
+   * measured_eef_wrench(6)`, which is what `scripts/export_rmb.py` wrote into the files it
+   * was trained on. Two details carry the whole risk, and neither would raise:
+   *
+   * - the pose is **translation first**, then the first two **rows** of the rotation matrix
+   *   (RMB's `PoseUtils._get_rotation_6d_from_matrix` slices `rot[..., :2, :]`). Columns
+   *   instead produce a valid-looking vector that is wrong in six of its entries.
+   * - the wrench is **force first**, where mc_rtc's `ForceVecd` is couple first.
+   *
+   * `scripts/export_onnx.py:pose9_from_pose7` in the learning repo is the tested reference
+   * for the first, and it is the same quantity as `collab_ft_wrench_world` for the second.
+   */
+  Eigen::VectorXd policyObservation() const;
+
+  /** Position and velocity of a point rigidly attached to a body, world frame.
+   *
+   * Mirrors `SimHumanPartner::aimedPoint`. The angular cross term is not optional: the hole
+   * sits well away from the wrist axis, so the offset point and the body origin have
+   * different velocities as soon as the wrist turns.
+   */
+  static void aimedPoint(const mc_rbdyn::Robot & robot,
+                         const std::string & body,
+                         const Eigen::Vector3d & point,
+                         Eigen::Vector3d & position,
+                         Eigen::Vector3d & velocity);
+
+  /** The force an intent-predicting policy produces, through the impedance of the partner it
+   * replaces.
+   *
+   * The policy emits where person A *meant* their hand to be. The force follows from the same
+   * spring the simulated partner used -- `f = kp (xRef - x) + kd (vRef - v)`, saturated at
+   * that partner's `max_force` -- because reproducing the law is what makes the policy a
+   * stand-in for the partner rather than a different actor wearing its name.
+   *
+   * `vRef` is not predicted: the reference velocity was never an action key. It is a filtered
+   * finite difference of the intent instead. Dropping it would leave pure damping, which is a
+   * materially different partner during transit, where the demonstrator's `kd vRef` is a
+   * large forward term.
+   *
+   * Split in two because they run at different rates. `updateIntentReference` is called at
+   * the policy rate, `intentForce` every control tick: an impedance evaluated only when a new
+   * prediction arrives is a constant push between predictions, not a spring, and would not
+   * react to the arm moving under it in the 9 ms in between.
+   */
+  void updateIntentReference(const Eigen::Vector3d & intent);
+  Eigen::Vector3d intentForce();
+
   // Frames / sensors (configurable per robot module).
   std::string tool_frame;
   std::string ft_sensor;
   std::string insertion_frame;
 
   // --- Behaviour-cloned partner (replaces person A) ---
-  collab::PolicyPartner policy_;
+  /** Either a `PolicyPartner` reading the YAML the learning repo writes, or an `OnnxBackend`
+   * running a RoboManipBaselines checkpoint. Chosen by the file's extension at load time;
+   * everything below this line is shared between them. */
+  std::unique_ptr<collab::PolicyBackend> policy_;
+  /** What the policy's output means: `force` (a world-frame force, applied directly) or
+   * `intent` (a point person A's plan aimed at, turned into a force by `intentForce`). Read
+   * out of the policy file, never configured -- the two need completely different handling
+   * and a config that can disagree with the file will one day disagree with it. */
+  std::string policyOutputKind_ = "force";
   bool policyEnabled_ = false;
   std::string policyPath_;
   /** Where the peg is, world frame. Scene knowledge the controller has no other source for.
@@ -154,6 +211,36 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   Eigen::Vector3d lastHole_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d holeVelocity_ = Eigen::Vector3d::Zero();
   bool haveLastHole_ = false;
+
+  // --- The intent path: policy -> impedance -> force (policyOutputKind_ == "intent") ---
+  /** Person A's impedance, copied from the partner this policy replaces. The *nominal* gains,
+   * not a per-episode `gain_sigma` draw: there is no person A at evaluation time to draw for,
+   * and the demonstrations' perturbations were of the partner, not of the plan. */
+  Eigen::Vector3d policyStiffness_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d policyDamping_ = Eigen::Vector3d::Zero();
+  double policyMaxForce_ = 0.0;
+  /** The point the impedance closes on -- where the replaced partner aimed, which is the
+   * point it pushed through. A spring anchored anywhere else is blind to the motion it
+   * causes; see SimHumanPartner's Partner docs. */
+  std::string policyRefBody_;
+  Eigen::Vector3d policyRefPoint_ = Eigen::Vector3d::Zero();
+  /** First-order filter on the differentiated intent, as a per-policy-step blend factor.
+   * 1.0 is the raw difference. The policy's prediction error lands directly in this
+   * derivative, so some smoothing is not optional. */
+  double policyVelocityFilter_ = 0.2;
+  Eigen::Vector3d policyIntent_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d lastIntent_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d policyRefVelocity_ = Eigen::Vector3d::Zero();
+  bool haveLastIntent_ = false;
+  /** Whether the impedance hit `max_force` this tick. Logged: a policy that saturates
+   * constantly is aiming somewhere the arm cannot follow, which reads as a control problem
+   * and is a prediction problem. */
+  bool policySaturated_ = false;
+  /** Log the 29-value RMB observation every tick. Off by default: it is log volume no run
+   * needs, and it exists for one job -- recording a *demonstration* with it set, so the
+   * vector the controller assembles can be compared frame for frame against the one
+   * `scripts/export_rmb.py` wrote from the same episode. */
+  bool logPolicyObservation_ = false;
   /** Jacobian at person A's contact point, built once. Constructing an rbd::Jacobian
    * allocates, and this runs on the control thread. */
   std::unique_ptr<rbd::Jacobian> policyJac_;

@@ -1,11 +1,15 @@
-set(controller_SRC CollabPegInHoleController.cpp PolicyPartner.cpp)
+# ONNXRUNTIME_INCLUDE_DIR / ONNXRUNTIME_LIB and the install rpath come from the top-level
+# CMakeLists: the rpath has to be set before any target here is created.
 
-set(controller_HDR CollabPegInHoleController.h PolicyPartner.h)
+set(controller_SRC CollabPegInHoleController.cpp PolicyPartner.cpp OnnxBackend.cpp)
+
+set(controller_HDR CollabPegInHoleController.h PolicyPartner.h PolicyBackend.h OnnxBackend.h)
 
 add_library(${PROJECT_NAME} SHARED ${controller_SRC} ${controller_HDR})
 set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS
                                                  "-DCollabPegInHoleController_EXPORTS")
-target_link_libraries(${PROJECT_NAME} PUBLIC mc_rtc::mc_control_fsm)
+target_link_libraries(${PROJECT_NAME} PUBLIC mc_rtc::mc_control_fsm ${ONNXRUNTIME_LIB})
+target_include_directories(${PROJECT_NAME} PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
 install(
   TARGETS ${PROJECT_NAME}
   ARCHIVE DESTINATION "${MC_RTC_LIBDIR}"

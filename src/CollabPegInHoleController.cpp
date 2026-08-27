@@ -1,5 +1,9 @@
 #include "CollabPegInHoleController.h"
 
+// Only here, not in the header: onnxruntime's C++ API is a large include, and nothing in the
+// controller's interface mentions it.
+#include "OnnxBackend.h"
+
 #include <mc_rbdyn/ForceSensor.h>
 #include <mc_rtc/gui/Button.h>
 #include <mc_rtc/gui/Checkbox.h>
@@ -170,31 +174,103 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       pegTarget_ = pconfig("peg_target");
       havePegTarget_ = true;
     }
+    // The intent path's impedance: the gains of the partner being replaced. Read whether or
+    // not the policy turns out to need them, so a mismatch is reported below rather than
+    // silently producing a zero-stiffness partner, which is not a soft partner but an absent
+    // one.
+    pconfig("stiffness", policyStiffness_);
+    pconfig("damping", policyDamping_);
+    pconfig("max_force", policyMaxForce_);
+    // Default to the contact itself: a partner aims through the point it pushes, and only a
+    // configuration that deliberately separates them says otherwise.
+    policyRefBody_ = policyBody_;
+    policyRefPoint_ = policyPoint_;
+    pconfig("reference_body", policyRefBody_);
+    pconfig("reference_point", policyRefPoint_);
+    pconfig("velocity_filter", policyVelocityFilter_);
+    pconfig("log_observation", logPolicyObservation_);
     if(policyEnabled_)
     {
-      if(!havePegTarget_)
-      {
-        mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.enabled is set but policy.peg_target is "
-                                     "not. The error the policy closes is (peg - hole), and the controller has no "
-                                     "other source for where the peg is.");
-      }
       if(policyDecimation_ < 1)
       {
         mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.decimation must be >= 1, got {}",
                                      policyDecimation_);
       }
-      policy_.load(policyPath_);
-      policy_.checkFeatureOrder(policyFeatureNames(policy_.withPhase()));
-      if(policy_.withPhase())
+      // The extension decides the backend, and the backend decides what its output means.
+      // Neither is configurable: a `policy.output` key that could disagree with the file is a
+      // way to run an intent through the force path, which produces motion and no error.
+      if(policyPath_.size() >= 5 && policyPath_.compare(policyPath_.size() - 5, 5, ".onnx") == 0)
       {
-        mc_rtc::log::error_and_throw("[CollabPegInHoleController] this policy was trained with the episode clock "
-                                     "in its observation, which this controller does not provide: it has no "
-                                     "episode phase outside a plugin-driven batch. Retrain without --with-phase.");
+        auto backend = std::make_unique<collab::OnnxBackend>(policyPath_);
+        policyOutputKind_ = backend->outputKind();
+        policy_ = std::move(backend);
       }
-      mc_rtc::log::info("[CollabPegInHoleController] policy partner '{}' active, evaluated every {} ticks "
-                        "({:.0f} Hz), peg at [{:.3f}, {:.3f}, {:.3f}]",
-                        policy_.partner(), policyDecimation_, 1.0 / (timeStep * policyDecimation_), pegTarget_.x(),
-                        pegTarget_.y(), pegTarget_.z());
+      else
+      {
+        auto backend = std::make_unique<collab::PolicyPartner>();
+        backend->load(policyPath_);
+        backend->checkFeatureOrder(policyFeatureNames(backend->withPhase()));
+        if(backend->withPhase())
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] this policy was trained with the episode clock "
+                                       "in its observation, which this controller does not provide: it has no "
+                                       "episode phase outside a plugin-driven batch. Retrain without --with-phase.");
+        }
+        policyOutputKind_ = "force";
+        policy_ = std::move(backend);
+      }
+
+      if(policyOutputKind_ == "force")
+      {
+        // Only the force policy observes (peg - hole). An intent policy's observation is the
+        // robot's own state, so requiring the peg there would be asking for a number that
+        // changes nothing.
+        if(!havePegTarget_)
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.enabled is set with a force-predicting "
+                                       "policy but policy.peg_target is not. The error that policy closes is "
+                                       "(peg - hole), and the controller has no other source for where the peg is.");
+        }
+        if(policy_->nOut() != 3)
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] a force policy must emit 3 values, this one "
+                                       "emits {}",
+                                       policy_->nOut());
+        }
+      }
+      else
+      {
+        if(policy_->nOut() < 3)
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] an intent policy must emit at least 3 values "
+                                       "(the translation of a pose), this one emits {}",
+                                       policy_->nOut());
+        }
+        if((policyStiffness_.array() <= 0).any() || (policyDamping_.array() < 0).any() || policyMaxForce_ <= 0)
+        {
+          mc_rtc::log::error_and_throw(
+              "[CollabPegInHoleController] this policy predicts an intent, which only becomes a force through the "
+              "impedance of the partner it replaces -- so policy.stiffness, policy.damping and policy.max_force are "
+              "required and must be positive. Got kp [{}], kd [{}], max {}.",
+              policyStiffness_.transpose(), policyDamping_.transpose(), policyMaxForce_);
+        }
+        if(!(policyVelocityFilter_ > 0.0 && policyVelocityFilter_ <= 1.0))
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.velocity_filter must be in (0, 1], got {}",
+                                       policyVelocityFilter_);
+        }
+      }
+      mc_rtc::log::info("[CollabPegInHoleController] policy partner '{}' active ({} output), evaluated every {} "
+                        "ticks ({:.0f} Hz)",
+                        policy_->partner(), policyOutputKind_, policyDecimation_,
+                        1.0 / (timeStep * policyDecimation_));
+      if(policyOutputKind_ == "intent")
+      {
+        mc_rtc::log::info("[CollabPegInHoleController]   impedance kp [{:.1f}] kd [{:.1f}] max {:.1f} N about "
+                          "'{}', reference velocity filtered at {:.2f}",
+                          policyStiffness_.x(), policyDamping_.x(), policyMaxForce_, policyRefBody_,
+                          policyVelocityFilter_);
+      }
     }
   }
 
@@ -926,9 +1002,84 @@ Eigen::VectorXd CollabPegInHoleController::policyFeatures() const
   return x;
 }
 
+Eigen::VectorXd CollabPegInHoleController::policyObservation() const
+{
+  const auto & r = robot();
+
+  const auto & q = r.encoderValues();
+  const auto & dq = r.encoderVelocities();
+
+  const sva::PTransformd & X_0_tool = r.frame(tool_frame).position();
+  // Rebuilt from the quaternion rather than used directly, so this is the same matrix the
+  // training data's quaternion produced when RMB reconstructed it. The two agree, but going
+  // through the quaternion is what makes that a fact rather than a hope.
+  const Eigen::Matrix3d rotation = Eigen::Quaterniond(X_0_tool.rotation()).toRotationMatrix();
+
+  sva::ForceVecd wrench = sva::ForceVecd::Zero();
+  if(r.hasForceSensor(ft_sensor)) { wrench = r.forceSensor(ft_sensor).worldWrenchWithoutGravity(r); }
+
+  // 7 + 7 + 9 + 6 = 29, and the order is RMB's --state_keys order:
+  // measured_joint_pos, measured_joint_vel, measured_eef_pose, measured_eef_wrench.
+  Eigen::VectorXd x = Eigen::VectorXd::Zero(29);
+  for(std::size_t i = 0; i < 7 && i < q.size(); ++i) { x(static_cast<Eigen::Index>(i)) = q[i]; }
+  for(std::size_t i = 0; i < 7 && i < dq.size(); ++i) { x(7 + static_cast<Eigen::Index>(i)) = dq[i]; }
+  x.segment<3>(14) = X_0_tool.translation();
+  // ROWS of the rotation matrix, not columns. See the header.
+  x.segment<3>(17) = rotation.row(0);
+  x.segment<3>(20) = rotation.row(1);
+  // Force first, then couple -- the opposite of how ForceVecd stores them.
+  x.segment<3>(23) = wrench.force();
+  x.segment<3>(26) = wrench.couple();
+  return x;
+}
+
+void CollabPegInHoleController::aimedPoint(const mc_rbdyn::Robot & robot,
+                                           const std::string & body,
+                                           const Eigen::Vector3d & point,
+                                           Eigen::Vector3d & position,
+                                           Eigen::Vector3d & velocity)
+{
+  const sva::PTransformd & X_0_b = robot.bodyPosW(body);
+  // sva stores the rotation as world->body, so the transpose maps a body-frame offset back
+  // into the world.
+  const Eigen::Vector3d offsetW = X_0_b.rotation().transpose() * point;
+  position = X_0_b.translation() + offsetW;
+  const sva::MotionVecd & V_0_b = robot.bodyVelW(body);
+  velocity = V_0_b.linear() + V_0_b.angular().cross(offsetW);
+}
+
+void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & intent)
+{
+  const double interval = timeStep * policyDecimation_;
+  // The derivative of a prediction, so it carries the prediction's error: filtered, and the
+  // first step taken as zero rather than as a step from an arbitrary initial value.
+  const Eigen::Vector3d raw = haveLastIntent_ ? Eigen::Vector3d((intent - lastIntent_) / interval)
+                                              : Eigen::Vector3d(Eigen::Vector3d::Zero());
+  policyRefVelocity_ = policyVelocityFilter_ * raw + (1.0 - policyVelocityFilter_) * policyRefVelocity_;
+  policyIntent_ = intent;
+  lastIntent_ = intent;
+  haveLastIntent_ = true;
+}
+
+Eigen::Vector3d CollabPegInHoleController::intentForce()
+{
+  Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
+  Eigen::Vector3d handVel = Eigen::Vector3d::Zero();
+  aimedPoint(robot(), policyRefBody_, policyRefPoint_, handPos, handVel);
+
+  Eigen::Vector3d force = policyStiffness_.cwiseProduct(policyIntent_ - handPos)
+                          + policyDamping_.cwiseProduct(policyRefVelocity_ - handVel);
+  const double norm = force.norm();
+  // The same saturation the simulated partner applies: a human is not an ideal spring, and
+  // without it an initial offset produces a transient no arm could apply.
+  policySaturated_ = norm > policyMaxForce_;
+  if(policySaturated_ && norm > 1e-9) { force *= policyMaxForce_ / norm; }
+  return force;
+}
+
 void CollabPegInHoleController::updatePolicyPartner()
 {
-  if(!policyEnabled_ || !policy_.loaded() || !eeInSolver_)
+  if(!policyEnabled_ || !policy_ || !eeInSolver_)
   {
     // Zero it rather than leaving it: refAccel_ persists across ticks and compEETask->reset()
     // does not clear it, so a stale feed-forward would keep pushing after the episode.
@@ -936,6 +1087,11 @@ void CollabPegInHoleController::updatePolicyPartner()
     policyForce_.setZero();
     policyAccel_.setZero();
     policyWrenchNorm_ = 0.0;
+    // The intent's derivative must not survive a gap in which the arm kept moving: resuming
+    // with a stale reference velocity injects a `kd vRef` term from before the pause.
+    policyRefVelocity_.setZero();
+    haveLastIntent_ = false;
+    policySaturated_ = false;
     return;
   }
 
@@ -946,15 +1102,29 @@ void CollabPegInHoleController::updatePolicyPartner()
   }
   const Eigen::Vector3d hole = r.frame(insertion_frame).position().translation();
 
-  if(policyTick_ % policyDecimation_ == 0)
+  const bool policyStep = policyTick_ % policyDecimation_ == 0;
+  if(policyOutputKind_ == "force")
   {
-    const double interval = timeStep * policyDecimation_;
-    // Not a ternary: the two Eigen expression types have no common type to collapse to.
-    if(haveLastHole_) { holeVelocity_ = (hole - lastHole_) / interval; }
-    else { holeVelocity_.setZero(); }
-    lastHole_ = hole;
-    haveLastHole_ = true;
-    policyForce_ = policy_(policyFeatures());
+    if(policyStep)
+    {
+      const double interval = timeStep * policyDecimation_;
+      // Not a ternary: the two Eigen expression types have no common type to collapse to.
+      if(haveLastHole_) { holeVelocity_ = (hole - lastHole_) / interval; }
+      else { holeVelocity_.setZero(); }
+      lastHole_ = hole;
+      haveLastHole_ = true;
+      policyForce_ = policy_->predict(policyFeatures()).head<3>();
+    }
+  }
+  else
+  {
+    // The *intent* is predicted at the policy rate and held; the *force* is recomputed every
+    // tick from it. That asymmetry is the point: an impedance held constant between policy
+    // steps is not a spring, it is a constant push, and it would not react to the arm moving
+    // under it in the 9 ms between predictions. The demonstrating partner evaluated its own
+    // spring every tick against a reference it interpolated -- this is the same shape.
+    if(policyStep) { updateIntentReference(policy_->predict(policyObservation()).head<3>()); }
+    policyForce_ = intentForce();
   }
   ++policyTick_;
 
@@ -1284,6 +1454,33 @@ void CollabPegInHoleController::addLog()
   logger().addLogEntry("collab_policy_force", this, [this]() -> const Eigen::Vector3d & { return policyForce_; });
   logger().addLogEntry("collab_policy_accel", this, [this]() -> const Eigen::Vector6d & { return policyAccel_; });
   logger().addLogEntry("collab_policy_trigger", this, [this]() { return policyWrenchNorm_; });
+  // The intent path's own state. Logged even on the force path, where it stays zero: a
+  // channel that appears and disappears between runs is one the extractor has to special-case.
+  logger().addLogEntry("collab_policy_intent", this, [this]() -> const Eigen::Vector3d & { return policyIntent_; });
+  logger().addLogEntry("collab_policy_intent_velocity", this,
+                       [this]() -> const Eigen::Vector3d & { return policyRefVelocity_; });
+  // Distance from the predicted intent to the point the impedance pulls: the policy's own
+  // tracking error, and the thing to read when the dyad moves but does not insert.
+  logger().addLogEntry("collab_policy_intent_error", this,
+                       [this]() -> double
+                       {
+                         if(policyOutputKind_ != "intent" || policyRefBody_.empty()) { return 0.0; }
+                         Eigen::Vector3d position = Eigen::Vector3d::Zero();
+                         Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+                         aimedPoint(robot(), policyRefBody_, policyRefPoint_, position, velocity);
+                         return (policyIntent_ - position).norm();
+                       });
+  logger().addLogEntry("collab_policy_saturated", this, [this]() -> double { return policySaturated_ ? 1.0 : 0.0; });
+  if(logPolicyObservation_)
+  {
+    // Off by default -- 29 doubles per tick at 1 kHz is real log volume for something no run
+    // needs. On, it is the only way to check the observation the controller assembles against
+    // the one export_rmb.py wrote from the *same episode*: record a demonstration with this
+    // set, and the two vectors must agree frame for frame. That comparison is what proves the
+    // pose is rows-not-columns and the wrench force-first, which nothing else would report.
+    logger().addLogEntry("collab_policy_observation", this,
+                         [this]() -> Eigen::VectorXd { return policyObservation(); });
+  }
   logger().addLogEntry("collab_ext_wrench", this, [this]() -> sva::ForceVecd { return externalWrench_; });
   logger().addLogEntry("collab_ext_wrench_norm", this, [this]() -> double { return externalWrench_.vector().norm(); });
   // The A-only counterpart of collab_ext_wrench, in the same frame and the same units, so the

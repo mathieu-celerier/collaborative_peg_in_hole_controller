@@ -18,6 +18,30 @@ if(NOT TARGET mc_rtc::mc_control)
   find_package(mc_rtc REQUIRED)
 endif()
 
+# onnxruntime runs the RoboManipBaselines policies (src/OnnxBackend.cpp). Found here rather
+# than in src/ because the rpath below has to reach every target: the FSM state libraries and
+# the controller entry point all link libCollabPegInHoleController.so, and inherit its need for
+# libonnxruntime.so.1.
+#
+# Not vendored the way rl_kinova_ball_balancing does it -- nix supplies it, and installing a
+# second libonnxruntime.so beside the store's is a way to end up loading two of them.
+find_path(
+  ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+  PATH_SUFFIXES onnxruntime
+  REQUIRED)
+find_library(
+  ONNXRUNTIME_LIB
+  NAMES onnxruntime
+  REQUIRED)
+get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIB}" DIRECTORY)
+
+# Without this the install strips the build rpath and libonnxruntime.so.1 becomes
+# unresolvable. The failure is silent and never mentions onnxruntime: mc_rtc dlopens each FSM
+# state library, every dlopen fails because a dependency cannot be loaded, and what is reported
+# is "origin state (..._Initial) is not loaded", then "None of the transitions you attempted to
+# load in this TransitionMap are valid".
+list(APPEND CMAKE_INSTALL_RPATH "${ONNXRUNTIME_LIB_DIR}")
+
 add_subdirectory(src)
 
 # Simulation-only: applies the simulated human partners as external wrenches in mc_mujoco.

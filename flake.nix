@@ -58,6 +58,16 @@
                 # the working superbuild run peaks at |alphaDOut| = 16 over 26 s.
                 configurations.CollabPegInHoleController.timeStep = 0.001;
 
+                # src/OnnxBackend.cpp runs the RoboManipBaselines policies. package.nix's
+                # propagatedBuildInputs covers the release build, but the devel shell is
+                # assembled from `devel.*` and `extraBuildInputs` only — and `inputsFrom` reads
+                # a derivation's *dependencies*, so listing the controller under devel.apps
+                # would inherit its deps and still leave onnxruntime's headers off
+                # CMAKE_PREFIX_PATH. This is the option that puts them there, and it covers the
+                # runtime shell too, where LD_LIBRARY_PATH has to carry libonnxruntime.so for
+                # the locally-built controller.
+                extraBuildInputs = [ pkgs.onnxruntime ];
+
                 configurations.CollabPegInHoleController.devel.apps = [
                   # This derivation is never built: `inputsFrom` only reads its dependency
                   # lists to assemble the shell. So the two adjustments below cost nothing and

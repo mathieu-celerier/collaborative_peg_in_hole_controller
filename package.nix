@@ -3,6 +3,7 @@
   mkMcRtcController,
   cmake,
   mc-rtc,
+  onnxruntime,
 }:
 
 mkMcRtcController {
@@ -12,7 +13,13 @@ mkMcRtcController {
   src = lib.cleanSource ./.;
 
   nativeBuildInputs = [ cmake ];
-  propagatedBuildInputs = [ mc-rtc ];
+  # onnxruntime is propagated, not a plain buildInput, so it also lands in the devel shell's
+  # inputsFrom: `../mcdev build` compiles src/OnnxBackend.cpp against the same headers the
+  # release build uses, rather than against whatever a system copy happens to be.
+  propagatedBuildInputs = [
+    mc-rtc
+    onnxruntime
+  ];
 
   doCheck = false;
 
