@@ -2,10 +2,10 @@
 # CMakeLists: the rpath has to be set before any target here is created.
 
 set(controller_SRC CollabPegInHoleController.cpp PolicyPartner.cpp OnnxBackend.cpp
-                   IntentReplay.cpp)
+                   IntentReplay.cpp RemotePolicy.cpp)
 
 set(controller_HDR CollabPegInHoleController.h PolicyPartner.h PolicyBackend.h OnnxBackend.h
-                   IntentReplay.h)
+                   IntentReplay.h RemotePolicy.h)
 
 add_library(${PROJECT_NAME} SHARED ${controller_SRC} ${controller_HDR})
 set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS

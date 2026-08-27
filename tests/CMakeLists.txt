@@ -27,3 +27,12 @@ target_include_directories(test_controller PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME test_controller
          COMMAND test_controller
                  ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/etc/mc_rtc.yaml)
+
+# Exercises the wire protocol against a live scripts/serve_policy.py. NOT registered with
+# add_test: it needs a server and a GPU, so it cannot run in an ordinary `ctest`. Build it
+# and run it by hand when the protocol changes on either side -- which is the only way to
+# test framing, since a mock would only check this file's idea of the protocol against
+# itself.
+add_executable(test_remote_policy EXCLUDE_FROM_ALL test_remote_policy.cpp)
+target_link_libraries(test_remote_policy PUBLIC CollabPegInHoleController)
+target_include_directories(test_remote_policy PRIVATE "${PROJECT_SOURCE_DIR}/src")
