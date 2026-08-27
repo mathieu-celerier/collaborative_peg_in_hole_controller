@@ -189,6 +189,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("reference_point", policyRefPoint_);
     pconfig("velocity_filter", policyVelocityFilter_);
     pconfig("log_observation", logPolicyObservation_);
+    pconfig("replay", policyReplayPath_);
     if(policyEnabled_)
     {
       if(policyDecimation_ < 1)
@@ -196,10 +197,28 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
         mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.decimation must be >= 1, got {}",
                                      policyDecimation_);
       }
+      // A replay stands in for the prediction, not for the controller: everything below the
+      // intent -- the impedance, the saturation, the Jacobian, the refAccel_ injection -- is
+      // the code a policy runs through, unchanged. That is the entire point of it, so it is
+      // wired in here rather than given a path of its own.
+      if(!policyReplayPath_.empty())
+      {
+        if(!policyPath_.empty())
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.replay and policy.path are both set. A "
+                                       "replay substitutes for the prediction, so exactly one of the two produces "
+                                       "the intent; running both would silently use one and look like the other.");
+        }
+        replay_ = std::make_unique<collab::IntentReplay>(policyReplayPath_, timeStep);
+        // A replay is a recorded intent by construction. There is no force variant: the
+        // recorded force belongs to the episode's own arm states and re-applying it open-loop
+        // would not be a partner at all.
+        policyOutputKind_ = "intent";
+      }
       // The extension decides the backend, and the backend decides what its output means.
       // Neither is configurable: a `policy.output` key that could disagree with the file is a
       // way to run an intent through the force path, which produces motion and no error.
-      if(policyPath_.size() >= 5 && policyPath_.compare(policyPath_.size() - 5, 5, ".onnx") == 0)
+      else if(policyPath_.size() >= 5 && policyPath_.compare(policyPath_.size() - 5, 5, ".onnx") == 0)
       {
         auto backend = std::make_unique<collab::OnnxBackend>(policyPath_);
         policyOutputKind_ = backend->outputKind();
@@ -240,7 +259,9 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       }
       else
       {
-        if(policy_->nOut() < 3)
+        // A replay has no forward pass, so nothing to size-check: its file is validated by
+        // IntentReplay's own constructor.
+        if(policy_ && policy_->nOut() < 3)
         {
           mc_rtc::log::error_and_throw("[CollabPegInHoleController] an intent policy must emit at least 3 values "
                                        "(the translation of a pose), this one emits {}",
@@ -262,8 +283,15 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       }
       mc_rtc::log::info("[CollabPegInHoleController] policy partner '{}' active ({} output), evaluated every {} "
                         "ticks ({:.0f} Hz)",
-                        policy_->partner(), policyOutputKind_, policyDecimation_,
+                        policy_ ? policy_->partner() : replay_->partner(), policyOutputKind_, policyDecimation_,
                         1.0 / (timeStep * policyDecimation_));
+      if(replay_)
+      {
+        mc_rtc::log::warning("[CollabPegInHoleController]   REPLAY, not a policy: {} recorded samples are being "
+                             "played back by episode tick. This measures the impedance and the refAccel injection, "
+                             "NOT a learned partner -- its success rate is not a policy result.",
+                             replay_->size());
+      }
       if(policyOutputKind_ == "intent")
       {
         mc_rtc::log::info("[CollabPegInHoleController]   impedance kp [{:.1f}] kd [{:.1f}] max {:.1f} N about "
@@ -1085,7 +1113,7 @@ void CollabPegInHoleController::updatePolicyPartner()
   // an observation nothing in the training set resembles. The predicted intent is then far
   // from the hand, person A's 520 N/m spring saturates at its 80 N ceiling immediately, and
   // the QP dies on the first tick of the Compliant state with "QLD fail code = 144".
-  if(!policyEnabled_ || !policy_ || !eeInSolver_ || !recording_)
+  if(!policyEnabled_ || (!policy_ && !replay_) || !eeInSolver_ || !recording_)
   {
     // Zero it rather than leaving it: refAccel_ persists across ticks and compEETask->reset()
     // does not clear it, so a stale feed-forward would keep pushing after the episode.
@@ -1098,6 +1126,9 @@ void CollabPegInHoleController::updatePolicyPartner()
     policyRefVelocity_.setZero();
     haveLastIntent_ = false;
     policySaturated_ = false;
+    // The anchor is per-episode: it is taken again, from wherever the next episode's hand
+    // starts, exactly as SimHumanPartner rebases its own plan at each episode start.
+    haveReplayAnchor_ = false;
     return;
   }
 
@@ -1129,7 +1160,32 @@ void CollabPegInHoleController::updatePolicyPartner()
     // steps is not a spring, it is a constant push, and it would not react to the arm moving
     // under it in the 9 ms between predictions. The demonstrating partner evaluated its own
     // spring every tick against a reference it interpolated -- this is the same shape.
-    if(policyStep) { updateIntentReference(policy_->predict(policyObservation()).head<3>()); }
+    if(replay_ && !haveReplayAnchor_)
+    {
+      // Taken at the first recording tick, before anything has moved, because that is the
+      // moment the recording's own plan was rebased. Taking it later would fold whatever the
+      // dyad had already done into the offset.
+      Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
+      Eigen::Vector3d handVel = Eigen::Vector3d::Zero();
+      aimedPoint(r, policyRefBody_, policyRefPoint_, handPos, handVel);
+      replay_->anchor(handPos);
+      haveReplayAnchor_ = true;
+      mc_rtc::log::info("[CollabPegInHoleController] replay anchored at [{:.4f} {:.4f} {:.4f}], {:.1f} mm from the "
+                        "recording's own start",
+                        handPos.x(), handPos.y(), handPos.z(), 1000.0 * replay_->offset().norm());
+    }
+    // One ternary, and everything after it is shared. A replay is worth running only if the
+    // code it runs through is bit-for-bit the code a policy runs through; a second branch
+    // below this line would make the result unfalsifiable.
+    if(policyStep)
+    {
+      // +1: run() calls this BEFORE incrementing episodeTick_, and startEpisode sets it to
+      // -1 so that the first recorded *sample* carries tick 0. So the tick this call will be
+      // logged under is one ahead of the member, and indexing on the member directly would
+      // play the recording back one control tick early.
+      updateIntentReference(replay_ ? replay_->at(episodeTick_ + 1)
+                                    : Eigen::Vector3d(policy_->predict(policyObservation()).head<3>()));
+    }
     policyForce_ = intentForce();
   }
   ++policyTick_;
@@ -1210,6 +1266,10 @@ void CollabPegInHoleController::startEpisode()
   }
   ++episodeId_;
   recording_ = true;
+  // Per-episode, so every episode's policy steps fall on the same ticks. Left running across
+  // episodes, the decimation phase would depend on how long the previous episode happened to
+  // be, and the first prediction of an episode could be up to `policyDecimation_` ticks late.
+  policyTick_ = 0;
   // run() increments before the logger samples the tick, so -1 here makes the first recorded
   // sample of the episode carry tick 0.
   episodeTick_ = -1;
@@ -1477,6 +1537,17 @@ void CollabPegInHoleController::addLog()
                          return (policyIntent_ - position).norm();
                        });
   logger().addLogEntry("collab_policy_saturated", this, [this]() -> double { return policySaturated_ ? 1.0 : 0.0; });
+  if(!policyReplayPath_.empty())
+  {
+    // Only when replaying, so a policy log cannot be mistaken for one. The offset says how
+    // far this episode started from the recording's own start: near zero means the replay is
+    // running in the episode it came from, which is the comparison worth making. `held` marks
+    // the ticks past the end of the recording, where the last sample is being held.
+    logger().addLogEntry("collab_policy_replay_offset", this,
+                         [this]() -> double { return replay_ ? 1000.0 * replay_->offset().norm() : 0.0; });
+    logger().addLogEntry("collab_policy_replay_held", this,
+                         [this]() -> double { return replay_ && replay_->exhausted(episodeTick_ + 1) ? 1.0 : 0.0; });
+  }
   if(logPolicyObservation_)
   {
     // Off by default -- 29 doubles per tick at 1 kHz is real log volume for something no run

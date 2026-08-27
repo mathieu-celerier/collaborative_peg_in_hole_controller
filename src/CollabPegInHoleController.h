@@ -7,6 +7,7 @@
 
 #include <RBDyn/Jacobian.h>
 
+#include "IntentReplay.h"
 #include "PolicyPartner.h"
 #include "api.h"
 
@@ -236,6 +237,16 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * constantly is aiming somewhere the arm cannot follow, which reads as a control problem
    * and is a prediction problem. */
   bool policySaturated_ = false;
+  /** The recorded intent replayed in place of a prediction, when `policy.replay` is set.
+   *
+   * Not a `PolicyBackend`: it observes nothing. It substitutes for exactly one thing -- the
+   * predicted point -- so that the impedance and the `refAccel_` injection below it can be
+   * exercised against a reference already known to have inserted. See IntentReplay.h. */
+  std::unique_ptr<collab::IntentReplay> replay_;
+  std::string policyReplayPath_;
+  /** Whether this episode's replay anchor has been taken yet. Taken once, at the first
+   * recording tick, because that is the moment SimHumanPartner rebases its own plan. */
+  bool haveReplayAnchor_ = false;
   /** Log the 29-value RMB observation every tick. Off by default: it is log volume no run
    * needs, and it exists for one job -- recording a *demonstration* with it set, so the
    * vector the controller assembles can be compared frame for frame against the one
