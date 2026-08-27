@@ -8,10 +8,12 @@
 int main(int argc, char ** argv)
 {
   const int port = argc > 1 ? std::atoi(argv[1]) : 5556;
-  collab::RemotePolicy policy("127.0.0.1", port, 2, 29);
+  collab::RemotePolicy policy("127.0.0.1", port);
+  std::printf("hello: %s for %s, %dx%d in, %dx%d out, skip %d\n", policy.name().c_str(), policy.partner().c_str(),
+              policy.nObsSteps(), policy.stateDim(), policy.nActionSteps(), policy.actionDim(), policy.skip());
 
   // Two observations fill the history; the first request should then go out.
-  Eigen::VectorXd x = Eigen::VectorXd::Zero(29);
+  Eigen::VectorXd x = Eigen::VectorXd::Zero(policy.stateDim());
   x(14) = 0.45;
   x(15) = 0.00;
   x(16) = 0.43; // a plausible tool position

@@ -1,5 +1,6 @@
 #include "RemotePolicy.h"
 
+#include <mc_rtc/Configuration.h>
 #include <mc_rtc/logging.h>
 
 #include <arpa/inet.h>
@@ -35,14 +36,8 @@ void writeHeader(char * into, std::uint32_t seq, std::uint16_t rows, std::uint16
 
 } // namespace
 
-RemotePolicy::RemotePolicy(const std::string & host, int port, int nObsSteps, int stateDim)
-: nObsSteps_(nObsSteps), stateDim_(stateDim)
+RemotePolicy::RemotePolicy(const std::string & host, int port)
 {
-  if(nObsSteps_ < 1 || stateDim_ < 1)
-  {
-    mc_rtc::log::error_and_throw("[RemotePolicy] nonsense shape: {} obs steps of {} values", nObsSteps_, stateDim_);
-  }
-
   fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if(fd_ < 0)
   {
@@ -75,10 +70,76 @@ RemotePolicy::RemotePolicy(const std::string & host, int port, int nObsSteps, in
   // inference it is carrying, and it would be invisible -- the policy would simply look slow.
   int one = 1;
   ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  // Only now: every read and write below assumes it returns immediately.
-  ::fcntl(fd_, F_SETFL, ::fcntl(fd_, F_GETFL, 0) | O_NONBLOCK);
 
-  mc_rtc::log::info("[RemotePolicy] connected to {}:{}, sending {}x{} observations", host, port, nObsSteps_, stateDim_);
+  // Read the hello while still blocking. It arrives immediately, it happens once, and every
+  // field below has to be known before the first observation can even be assembled.
+  readHello(host, port);
+
+  // Only now: every read and write after this assumes it returns immediately.
+  ::fcntl(fd_, F_SETFL, ::fcntl(fd_, F_GETFL, 0) | O_NONBLOCK);
+}
+
+void RemotePolicy::readHello(const std::string & host, int port)
+{
+  char header[HEADER_SIZE];
+  std::size_t got = 0;
+  while(got < HEADER_SIZE)
+  {
+    const auto n = ::recv(fd_, header + got, HEADER_SIZE - got, 0);
+    if(n <= 0)
+    {
+      mc_rtc::log::error_and_throw("[RemotePolicy] {}:{} accepted the connection but sent no hello. Is it really "
+                                   "scripts/serve_policy.py?",
+                                   host, port);
+    }
+    got += static_cast<std::size_t>(n);
+  }
+  std::uint32_t seq = 0;
+  std::uint16_t rows = 0;
+  std::uint16_t cols = 0;
+  std::memcpy(&seq, header + 8, 4);
+  std::memcpy(&rows, header + 12, 2);
+  std::memcpy(&cols, header + 14, 2);
+  if(std::memcmp(header, MAGIC, 4) != 0 || seq != 0 || rows != 1 || cols == 0)
+  {
+    mc_rtc::log::error_and_throw("[RemotePolicy] the first frame from {}:{} is not a hello", host, port);
+  }
+
+  std::string json(cols, '\0');
+  got = 0;
+  while(got < cols)
+  {
+    const auto n = ::recv(fd_, &json[got], cols - got, 0);
+    if(n <= 0)
+    {
+      mc_rtc::log::error_and_throw("[RemotePolicy] the hello from {}:{} was truncated", host, port);
+    }
+    got += static_cast<std::size_t>(n);
+  }
+
+  auto conf = mc_rtc::Configuration::fromData(json);
+  conf("n_obs_steps", nObsSteps_);
+  conf("state_dim", stateDim_);
+  conf("n_action_steps", nActionSteps_);
+  conf("action_dim", actionDim_);
+  conf("skip", skip_);
+  conf("partner", partner_);
+  conf("policy", name_);
+  if(nObsSteps_ < 1 || stateDim_ < 1 || nActionSteps_ < 1 || actionDim_ < 3)
+  {
+    mc_rtc::log::error_and_throw("[RemotePolicy] the server describes a nonsense policy: {}x{} in, {}x{} out",
+                                 nObsSteps_, stateDim_, nActionSteps_, actionDim_);
+  }
+  if(partner_.empty())
+  {
+    mc_rtc::log::error_and_throw("[RemotePolicy] the server names no partner, so nothing decides who stops pushing. "
+                                 "Start it with --partner.");
+  }
+  // Half the chunk, so the request goes out with an inference's worth of actions still to run.
+  refillAt_ = static_cast<std::size_t>(nActionSteps_) / 2;
+
+  mc_rtc::log::info("[RemotePolicy] {}:{} serves '{}' for partner '{}': {}x{} in, {}x{} out, skip {} (decimation {})",
+                    host, port, name_, partner_, nObsSteps_, stateDim_, nActionSteps_, actionDim_, skip_, skip_ * 10);
 }
 
 RemotePolicy::~RemotePolicy()

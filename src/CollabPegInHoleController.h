@@ -9,6 +9,7 @@
 
 #include "IntentReplay.h"
 #include "PolicyPartner.h"
+#include "RemotePolicy.h"
 #include "api.h"
 
 #include <deque>
@@ -244,6 +245,15 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * exercised against a reference already known to have inserted. See IntentReplay.h. */
   std::unique_ptr<collab::IntentReplay> replay_;
   std::string policyReplayPath_;
+  /** A chunked policy served by another process, when `policy.remote_port` is set.
+   *
+   * The third and last way an intent is produced, beside `policy_` (a forward pass here) and
+   * `replay_` (a recording). Exactly one of the three is ever non-null. It exists because a
+   * diffusion policy costs 22.6 ms per answer and the loop ticks every 1 ms; see
+   * RemotePolicy.h. */
+  std::unique_ptr<collab::RemotePolicy> remote_;
+  std::string policyRemoteHost_ = "127.0.0.1";
+  int policyRemotePort_ = 0;
   /** Whether this episode's replay anchor has been taken yet. Taken once, at the first
    * recording tick, because that is the moment SimHumanPartner rebases its own plan. */
   bool haveReplayAnchor_ = false;

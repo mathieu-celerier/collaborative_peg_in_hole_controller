@@ -47,9 +47,18 @@ namespace collab
 class RemotePolicy
 {
 public:
-  /** Connect to the server. Throws if it is not there: a policy run whose policy is absent
-   * must fail while the config is read, not four seconds into the first episode. */
-  RemotePolicy(const std::string & host, int port, int nObsSteps, int stateDim);
+  /** Connect, and read the server's hello.
+   *
+   * Throws if the server is not there: a policy run whose policy is absent must fail while the
+   * config is read, not four seconds into the first episode.
+   *
+   * Nothing about the policy's shape is passed in. The server speaks first and says how wide
+   * its observation is, how many steps of history it wants, what it emits, and at what `skip`
+   * it was trained -- the same discipline as `OnnxBackend` reading its dimensions off the
+   * graph. A controller *told* how wide its policy is will one day be told wrong, and a
+   * forward pass on a mis-sized vector answers instead of failing.
+   */
+  RemotePolicy(const std::string & host, int port);
   ~RemotePolicy();
 
   RemotePolicy(const RemotePolicy &) = delete;
@@ -109,6 +118,37 @@ public:
     return haveLastAction_ || !chunk_.empty();
   }
 
+  //! @name What the server said about itself on connect.
+  //!@{
+  int nObsSteps() const noexcept
+  {
+    return nObsSteps_;
+  }
+  int stateDim() const noexcept
+  {
+    return stateDim_;
+  }
+  int nActionSteps() const noexcept
+  {
+    return nActionSteps_;
+  }
+  /** The partner this policy replaces. Decides who stops pushing, as for a policy file. */
+  const std::string & partner() const noexcept
+  {
+    return partner_;
+  }
+  const std::string & name() const noexcept
+  {
+    return name_;
+  }
+  /** The dataset stride the policy was fitted at. The controller's `policy.decimation` must be
+   * ten times this, or the policy is being run at a rate it was never trained for. */
+  int skip() const noexcept
+  {
+    return skip_;
+  }
+  //!@}
+
   /** Actions left before a request must go out. Configurable because the right value depends
    * on the server's latency, which depends on the machine. */
   void refillAt(std::size_t remaining) noexcept
@@ -117,10 +157,16 @@ public:
   }
 
 private:
+  void readHello(const std::string & host, int port);
+
   int fd_ = -1;
   int nObsSteps_ = 1;
   int stateDim_ = 0;
   int actionDim_ = 0;
+  int nActionSteps_ = 0;
+  int skip_ = 0;
+  std::string partner_;
+  std::string name_;
 
   std::deque<Eigen::VectorXd> history_;
   std::deque<Eigen::VectorXd> chunk_;

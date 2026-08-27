@@ -190,6 +190,8 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("velocity_filter", policyVelocityFilter_);
     pconfig("log_observation", logPolicyObservation_);
     pconfig("replay", policyReplayPath_);
+    pconfig("remote_host", policyRemoteHost_);
+    pconfig("remote_port", policyRemotePort_);
     if(policyEnabled_)
     {
       if(policyDecimation_ < 1)
@@ -201,7 +203,29 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       // intent -- the impedance, the saturation, the Jacobian, the refAccel_ injection -- is
       // the code a policy runs through, unchanged. That is the entire point of it, so it is
       // wired in here rather than given a path of its own.
-      if(!policyReplayPath_.empty())
+      if(policyRemotePort_ > 0)
+      {
+        if(!policyPath_.empty() || !policyReplayPath_.empty())
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.remote_port is set alongside policy.path "
+                                       "or policy.replay. Exactly one of the three produces the intent; running two "
+                                       "would silently use one and read as the other.");
+        }
+        remote_ = std::make_unique<collab::RemotePolicy>(policyRemoteHost_, policyRemotePort_);
+        // The server knows the rate its policy was fitted at, and this controller is told the
+        // rate it will be run at. They have to be the same number: a policy stepped at 100 Hz
+        // when it was trained at 33 produces motion and no error anywhere.
+        const int expected = remote_->skip() * 10;
+        if(expected != policyDecimation_)
+        {
+          mc_rtc::log::error_and_throw("[CollabPegInHoleController] the server's policy was trained at skip {}, so it "
+                                       "must be stepped every {} ticks, but policy.decimation is {}. Regenerate the "
+                                       "config, or serve a checkpoint trained at the rate you want.",
+                                       remote_->skip(), expected, policyDecimation_);
+        }
+        policyOutputKind_ = "intent";
+      }
+      else if(!policyReplayPath_.empty())
       {
         if(!policyPath_.empty())
         {
@@ -283,8 +307,10 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       }
       mc_rtc::log::info("[CollabPegInHoleController] policy partner '{}' active ({} output), evaluated every {} "
                         "ticks ({:.0f} Hz)",
-                        policy_ ? policy_->partner() : replay_->partner(), policyOutputKind_, policyDecimation_,
-                        1.0 / (timeStep * policyDecimation_));
+                        policy_   ? policy_->partner()
+                        : remote_ ? remote_->partner()
+                                  : replay_->partner(),
+                        policyOutputKind_, policyDecimation_, 1.0 / (timeStep * policyDecimation_));
       if(replay_)
       {
         mc_rtc::log::warning("[CollabPegInHoleController]   REPLAY, not a policy: {} recorded samples are being "
@@ -1113,7 +1139,7 @@ void CollabPegInHoleController::updatePolicyPartner()
   // an observation nothing in the training set resembles. The predicted intent is then far
   // from the hand, person A's 520 N/m spring saturates at its 80 N ceiling immediately, and
   // the QP dies on the first tick of the Compliant state with "QLD fail code = 144".
-  if(!policyEnabled_ || (!policy_ && !replay_) || !eeInSolver_ || !recording_)
+  if(!policyEnabled_ || (!policy_ && !replay_ && !remote_) || !eeInSolver_ || !recording_)
   {
     // Zero it rather than leaving it: refAccel_ persists across ticks and compEETask->reset()
     // does not clear it, so a stale feed-forward would keep pushing after the episode.
@@ -1177,7 +1203,45 @@ void CollabPegInHoleController::updatePolicyPartner()
     // One ternary, and everything after it is shared. A replay is worth running only if the
     // code it runs through is bit-for-bit the code a policy runs through; a second branch
     // below this line would make the result unfalsifiable.
-    if(policyStep)
+    if(remote_)
+    {
+      // Every tick, not only on policy steps: a chunk that has arrived should be installed as
+      // soon as it exists, and a poll that finds nothing is one non-blocking recv returning
+      // EAGAIN. Nothing here can block the loop.
+      remote_->poll();
+      if(policyStep)
+      {
+        remote_->observe(policyObservation());
+        // After observing, so the request carries the freshest history; and while actions
+        // remain, so the answer lands before they run out. Waiting for the chunk to empty
+        // would starve every tick of one inference.
+        if(remote_->needsRefill())
+        {
+          remote_->request();
+        }
+      }
+      if(!remote_->ready())
+      {
+        // The first round trip of an episode: asked, not yet answered. The partner has not
+        // decided where to go, so it does not push. The alternative is an intent of zero,
+        // which is the world origin -- the spring would pull the arm off its home pose with
+        // everything it has. Lasts one inference, once per episode.
+        if(compEETask)
+        {
+          compEETask->refAccel(Eigen::Vector6d::Zero());
+        }
+        policyForce_.setZero();
+        policyAccel_.setZero();
+        policyWrenchNorm_ = 0.0;
+        ++policyTick_;
+        return;
+      }
+      if(policyStep)
+      {
+        updateIntentReference(remote_->next().head<3>());
+      }
+    }
+    else if(policyStep)
     {
       // +1: run() calls this BEFORE incrementing episodeTick_, and startEpisode sets it to
       // -1 so that the first recorded *sample* carries tick 0. So the tick this call will be
@@ -1270,6 +1334,13 @@ void CollabPegInHoleController::startEpisode()
   // episodes, the decimation phase would depend on how long the previous episode happened to
   // be, and the first prediction of an episode could be up to `policyDecimation_` ticks late.
   policyTick_ = 0;
+  // Drops the history, the chunk, and any request in flight. The last of those matters most:
+  // its answer was computed from the previous episode's observations, and applying it here
+  // would be a partner acting on where the arm used to be.
+  if(remote_)
+  {
+    remote_->reset();
+  }
   // run() increments before the logger samples the tick, so -1 here makes the first recorded
   // sample of the episode carry tick 0.
   episodeTick_ = -1;
@@ -1537,6 +1608,22 @@ void CollabPegInHoleController::addLog()
                          return (policyIntent_ - position).norm();
                        });
   logger().addLogEntry("collab_policy_saturated", this, [this]() -> double { return policySaturated_ ? 1.0 : 0.0; });
+  if(remote_)
+  {
+    // The number that decides whether a run is a result. A starved tick is one where the
+    // server had not answered and the last action was held, so a run with any of them
+    // measured the server's latency as much as the policy's predictions.
+    logger().addLogEntry("collab_policy_starved", this,
+                         [this]() -> double { return remote_ && remote_->starved() ? 1.0 : 0.0; });
+    logger().addLogEntry("collab_policy_chunk_left", this,
+                         [this]() -> double { return remote_ ? static_cast<double>(remote_->remaining()) : 0.0; });
+    logger().addLogEntry("collab_policy_in_flight", this,
+                         [this]() -> double { return remote_ && remote_->inFlight() ? 1.0 : 0.0; });
+    // Replies that arrived after their episode ended. Should be at most one per episode; more
+    // than that means the server is slower than a whole chunk and the run is not usable.
+    logger().addLogEntry("collab_policy_discarded", this,
+                         [this]() -> double { return remote_ ? static_cast<double>(remote_->discarded()) : 0.0; });
+  }
   if(!policyReplayPath_.empty())
   {
     // Only when replaying, so a policy log cannot be mistaken for one. The offset says how
