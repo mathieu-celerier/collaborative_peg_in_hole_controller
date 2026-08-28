@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace collab
 {
@@ -176,6 +177,30 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
           p.name);
     }
 
+    if(entry.has("search"))
+    {
+      auto s = entry("search");
+      s("amplitude", p.search.amplitude);
+      s("frequency", p.search.frequency);
+      s("stall_time", p.search.stallTime);
+      s("stall_progress", p.search.stallProgress);
+      s("lateral_radius", p.search.lateralRadius);
+      if(p.search.amplitude < 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a negative search amplitude. Use 0 to disable "
+            "the search; a negative radius is a circle traced backwards, which is the same "
+            "circle and almost certainly not what was meant.",
+            p.name);
+      }
+      if(p.search.enabled() && p.search.frequency <= 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a search amplitude but a non-positive frequency.",
+            p.name);
+      }
+    }
+
     Eigen::Vector3d cursor = Eigen::Vector3d::Zero();
     entry("start", cursor);
     double clock = p.startDelay;
@@ -217,6 +242,13 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
 
     mc_rtc::log::info("[SimHumanPartner] '{}' on body '{}': kp {:.1f} N/m, kd {:.1f} N.s/m, delay {:.0f} ms",
                       p.name, p.body, p.stiffness.x(), p.damping.x(), p.delay * 1000.0);
+    if(p.search.enabled())
+    {
+      mc_rtc::log::info("[SimHumanPartner] '{}' searches when stuck: {:.1f} mm at {:.1f} Hz after "
+                        "{:.1f} s without {:.1f} mm of progress, within {:.0f} mm of the peg",
+                        p.name, p.search.amplitude * 1000.0, p.search.frequency, p.search.stallTime,
+                        p.search.stallProgress * 1000.0, p.search.lateralRadius * 1000.0);
+    }
   }
 }
 
@@ -337,28 +369,48 @@ void SimHumanPartner::applyTargetDisagreement()
   // reliably: measured, every second episode ended 13-15 mm off the peg and never descended.
   // So the draws are centred here. Each partner keeps a belief of its own, the pair still
   // disagrees by the full sigma, and the point they settle on is the peg.
+  // A partner with zero gains applies no force, so it is not one of the springs whose
+  // equilibrium the mean describes. Centring over it would shift the real partners' beliefs
+  // by half of its draw and make a DAgger episode physically unlike the evaluation episode it
+  // is meant to label -- the one thing the ghost expert must not do. See `passive` in the
+  // learning repo's PartnerRole.
+  std::vector<Partner *> acting;
+  for(auto & p : partners_)
+  {
+    if(p.stiffness.isZero() && p.damping.isZero())
+    {
+      p.targetOffset.setZero();
+      continue;
+    }
+    acting.push_back(&p);
+  }
+  if(acting.empty())
+  {
+    return;
+  }
+
   std::normal_distribution<double> unit(0.0, 1.0);
   Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-  for(auto & p : partners_)
+  for(auto * p : acting)
   {
     for(int axis = 0; axis < 3; ++axis)
     {
-      p.targetOffset[axis] = noise_.targetSigma * unit(rng_);
+      p->targetOffset[axis] = noise_.targetSigma * unit(rng_);
     }
-    mean += p.targetOffset;
+    mean += p->targetOffset;
   }
-  mean /= static_cast<double>(partners_.size());
-  for(auto & p : partners_)
+  mean /= static_cast<double>(acting.size());
+  for(auto * p : acting)
   {
-    p.targetOffset -= mean;
+    p->targetOffset -= mean;
     // A person who is wrong about the target is wrong about it throughout the reach, not only
     // once they arrive, so the belief shifts the whole plan rather than only its end.
-    for(auto & seg : p.episodeSegments)
+    for(auto & seg : p->episodeSegments)
     {
-      seg.from += p.targetOffset;
-      seg.to += p.targetOffset;
+      seg.from += p->targetOffset;
+      seg.to += p->targetOffset;
     }
-    p.episodeFinalTarget += p.targetOffset;
+    p->episodeFinalTarget += p->targetOffset;
   }
 }
 
@@ -512,6 +564,14 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
     // Evaluating the intent in the past is the whole of the sensorimotor delay model: the
     // partner acts on where it meant to be a reaction time ago, not on where it is now.
     referenceAt(p, clock - p.delay, xRef, vRef);
+    // Added to the intent, deliberately: `reference` is what is logged, extracted and cloned,
+    // so a correction applied to the force instead would be invisible to a policy that
+    // imitates intent. Only while recording -- searchOffset() reads this episode's insertion
+    // measures, which are only computed then.
+    if(acting && phase_ == Phase::Recording)
+    {
+      xRef += searchOffset(p);
+    }
 
     // The error is measured at the point the person is aiming, which is the point they push
     // through -- anchoring the spring anywhere else makes it blind to the motion it causes.
@@ -725,6 +785,49 @@ void SimHumanPartner::updateEpisode(mc_control::MCGlobalController & controller)
   }
 }
 
+Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p)
+{
+  const double ramp = p.search.enabled() ? dt_ * p.search.frequency : 0.0;
+  if(!p.search.enabled())
+  {
+    p.searching = false;
+    p.searchEnvelope = 0.0;
+    p.searchOffset.setZero();
+    return p.searchOffset;
+  }
+
+  // Stuck means all three: we are at the peg rather than still travelling, we have never got
+  // it in, and the depth has not improved for a while. Dropping any one of them makes the
+  // dither fire during the reach, or keep firing after the peg is seated.
+  if(insertionDepthLog_ > p.bestDepth + p.search.stallProgress)
+  {
+    p.bestDepth = insertionDepthLog_;
+    p.lastProgressTime = episodeTime_;
+  }
+  const bool atPeg = insertionLateralLog_ < p.search.lateralRadius;
+  const bool stalled = episodeTime_ - p.lastProgressTime > p.search.stallTime;
+  p.searching = atPeg && !everInserted_ && stalled;
+
+  // Ramp over one period rather than switching, so the reference is continuous in both
+  // directions: a step of a whole amplitude is a kick the impedance turns into a force spike,
+  // and it would be the largest transient in the episode.
+  p.searchEnvelope = std::clamp(p.searchEnvelope + (p.searching ? ramp : -ramp), 0.0, 1.0);
+  if(p.searchEnvelope <= 0.0)
+  {
+    p.searchPhase = 0.0;
+    p.searchOffset.setZero();
+    return p.searchOffset;
+  }
+
+  // A circle, not a line: which way to move to find the hole is exactly what is unknown, so
+  // the search has to cover every lateral direction. Phase is integrated rather than computed
+  // from the clock so that starting, stopping and restarting cannot jump it.
+  p.searchPhase += 2.0 * M_PI * p.search.frequency * dt_;
+  const double radius = p.search.amplitude * p.searchEnvelope;
+  p.searchOffset = Eigen::Vector3d(radius * std::cos(p.searchPhase), radius * std::sin(p.searchPhase), 0.0);
+  return p.searchOffset;
+}
+
 void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const mc_rbdyn::Robot & robot)
 {
   // Start each partner's reach from where its aimed point actually is, rather than from a
@@ -740,6 +843,17 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
     Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
     aimedPoint(robot, p, position, velocity);
     rebase(p, position, holeOrigin);
+  }
+  for(auto & p : partners_)
+  {
+    // Not zero: the hole starts above the peg tip, so depth starts negative and the first
+    // tick would otherwise count as progress and reset the stall clock.
+    p.bestDepth = -std::numeric_limits<double>::infinity();
+    p.lastProgressTime = 0.0;
+    p.searching = false;
+    p.searchPhase = 0.0;
+    p.searchEnvelope = 0.0;
+    p.searchOffset.setZero();
   }
   collab.startEpisode();
   episodeTime_ = 0.0;
@@ -806,6 +920,11 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
     logger.addLogEntry(prefix + "_gain_scale", [this, i]() { return partners_[i].gainScale; });
     logger.addLogEntry(prefix + "_delay", [this, i]() { return partners_[i].delay; });
     logger.addLogEntry(prefix + "_delivered", [this, i]() { return partners_[i].delivered; });
+    // The search, logged whether or not it is enabled: an episode where nobody wiggled and one
+    // where the feature was compiled out have to be distinguishable in the dataset.
+    logger.addLogEntry(prefix + "_searching", [this, i]() { return partners_[i].searching; });
+    logger.addLogEntry(prefix + "_search_offset",
+                       [this, i]() -> const Eigen::Vector3d & { return partners_[i].searchOffset; });
   }
 }
 

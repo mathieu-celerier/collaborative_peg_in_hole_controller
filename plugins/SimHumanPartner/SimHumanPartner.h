@@ -154,6 +154,47 @@ private:
     Eigen::Vector3d targetOffset = Eigen::Vector3d::Zero();
     double gainScale = 1.0;
 
+    /** A corrective wiggle, for when the piece will not go in.
+     *
+     * A person whose peg has stopped going into the hole does not keep pushing harder along
+     * the same line -- they jiggle it. Without this, a dyad that arrives slightly off-axis is
+     * simply stuck: the plan runs to its end, the springs settle, and the episode records a
+     * static standoff. Nothing in the demonstrations then shows a policy what to do about
+     * being stuck, which is exactly the state a cloned policy spends its time in.
+     *
+     * The dither is added to the partner's *reference*, not to its force, so it lands in
+     * `reference`, is logged, is extracted, and is therefore **clonable**. A correction
+     * applied to the force would be invisible to a policy that clones intent.
+     *
+     * `amplitude` 0 disables it, so a config written before this existed is unchanged. */
+    struct Search
+    {
+      double amplitude = 0.0;       // m, radius of the lateral circle; 0 = off
+      double frequency = 1.5;       // Hz
+      double stallTime = 1.5;       // s without progress before deciding we are stuck
+      double stallProgress = 0.001; // m of extra depth that counts as progress
+      /** Only search when the hole is already near the peg.
+       *
+       * Wiggling while still travelling would corrupt the reach, and a dyad that is 100 mm
+       * away is not stuck, it is on its way. */
+      double lateralRadius = 0.015; // m
+      bool enabled() const { return amplitude > 0.0; }
+    };
+    Search search;
+
+    // Live search state, reset every episode by startRecording.
+    double bestDepth = 0.0;        // deepest the hole has got this episode, m
+    double lastProgressTime = 0.0; // episode time when bestDepth last improved, s
+    bool searching = false;        // is the stuck condition true right now
+    double searchPhase = 0.0;      // rad, integrated so a frequency change cannot step the output
+    /** 0..1, ramped in and out over one period.
+     *
+     * Without it the circle would start at full radius on its first tick, which is a step in
+     * the reference of a whole amplitude -- a kick, not a wiggle, and one the impedance turns
+     * into a force spike. */
+    double searchEnvelope = 0.0;
+    Eigen::Vector3d searchOffset = Eigen::Vector3d::Zero(); // what was added this tick, m
+
     // Live state, for logging and the GUI.
     Eigen::Vector3d reference = Eigen::Vector3d::Zero();
     Eigen::Vector3d handPosition = Eigen::Vector3d::Zero(); // the aimed point, world frame
@@ -230,6 +271,11 @@ private:
   void updateEpisode(mc_control::MCGlobalController & controller);
   /** Rebase every partner's reach and open an episode. */
   void startRecording(CollabPegInHoleController & collab, const mc_rbdyn::Robot & robot);
+  /** Update one partner's stuck state and return the dither to add to its reference.
+   *
+   * Reads the insertion measures cached by `insertionDepth` earlier in the same tick, so it
+   * must be called from `before()` after `updateEpisode()`. */
+  Eigen::Vector3d searchOffset(Partner & partner);
 
   // Last evaluated insertion measures, kept only so the success decision is auditable in the
   // log rather than being a verdict with no evidence behind it.
