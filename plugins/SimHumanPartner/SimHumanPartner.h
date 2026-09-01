@@ -185,7 +185,24 @@ private:
       double contactForce = 2.0;
       double stallTime = 0.5;      // s without the piece moving before deciding it is stuck
       double stallMotion = 0.001; // m the piece must travel to count as still going in
+      /** Seconds of accumulated searching to grow the circle from nothing to `amplitude`.
+       *
+       * 0 keeps the original fixed-radius circle. Anything else makes it a spiral, which is a
+       * different search and a better-posed one: a circle only finds the hole when its radius
+       * happens to match how far off the piece landed, and that distance varies episode to
+       * episode (p10 6.3 mm, p90 18.2 mm), so no single radius is right for most of them.
+       * Measured on the fixed circle, the median failed episode never came within the 10 mm
+       * lip at all -- only 22-27 % of them ever did -- because the piece was orbiting at a
+       * radius of about 3 mm around a point 13.6 mm out. A spiral crosses every radius from 0
+       * up to `amplitude`, so it passes over the hole whenever the amplitude exceeds the
+       * offset instead of depending on the two matching.
+       *
+       * Sized against the search budget, not chosen freely: a failed episode gets a median
+       * 6.4 s of searching in total, so a spiral much slower than that never reaches its
+       * outer radius before the episode ends. */
+      double spiralTime = 0.0;
       bool enabled() const { return amplitude > 0.0; }
+      bool spiral() const { return spiralTime > 0.0; }
     };
     Search search;
 
@@ -199,6 +216,18 @@ private:
      * the reference of a whole amplitude -- a kick, not a wiggle, and one the impedance turns
      * into a force spike. */
     double searchEnvelope = 0.0;
+    /** 0..1, how far along the spiral this partner has got, in accumulated searching time.
+     *
+     * Kept apart from `searchEnvelope` because the two answer different questions, and
+     * conflating them is what makes a spiral impossible here: the envelope says whether the
+     * offset is being applied *now* and must fall to zero the moment the search releases, but
+     * the progress must survive that, or the spiral restarts from nothing every time.
+     *
+     * It has to survive it because the search does not run in one stretch. Measured over the
+     * failed episodes of two arms, it fires in a median 5-6.5 bursts of a median 0.48-0.56 s
+     * -- 50 degrees of arc at 0.25 Hz -- and fewer than 3 % of bursts last a whole turn. A
+     * radius that resets per burst never leaves the middle of the circle. */
+    double spiralProgress = 0.0;
     Eigen::Vector3d searchOffset = Eigen::Vector3d::Zero(); // what was added this tick, m
 
     // Live state, for logging and the GUI.

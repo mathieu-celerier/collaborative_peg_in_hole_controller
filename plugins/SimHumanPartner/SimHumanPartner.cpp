@@ -185,6 +185,7 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
       s("contact_force", p.search.contactForce);
       s("stall_time", p.search.stallTime);
       s("stall_motion", p.search.stallMotion);
+      s("spiral_time", p.search.spiralTime);
       if(p.search.amplitude < 0.0)
       {
         mc_rtc::log::error_and_throw<std::runtime_error>(
@@ -850,7 +851,14 @@ void SimHumanPartner::updateStuck(const Eigen::Vector3d & piece)
 
 Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
 {
-  const double ramp = p.search.enabled() ? dt_ * p.search.frequency : 0.0;
+  // The spiral ramps four times faster than the fixed circle, and can afford to: its radius
+  // is amplitude * spiralProgress, which starts near zero, so its early bursts are gentle
+  // however quickly the envelope moves. It also has to be faster. The median burst lasts
+  // 0.48-0.56 s, so a full-period ramp leaves every one of them at roughly a seventh of the
+  // radius it asked for -- which is exactly what the fixed circle was measured doing, 1-5 mm
+  // of piece motion for an 8-48 mm command.
+  const double ramp =
+      p.search.enabled() ? dt_ * p.search.frequency * (p.search.spiral() ? 4.0 : 1.0) : 0.0;
   if(!p.search.enabled())
   {
     p.searching = false;
@@ -883,6 +891,16 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
   // directions: a step of a whole amplitude is a kick the impedance turns into a force spike,
   // and it would be the largest transient in the episode.
   p.searchEnvelope = std::clamp(p.searchEnvelope + (p.searching ? ramp : -ramp), 0.0, 1.0);
+
+  // Progress up the spiral accrues with searching time and is never given back inside an
+  // episode, which is the whole point of keeping it separate from the envelope: the search
+  // arrives in short bursts, and a radius that restarted with each one would never get out of
+  // the middle of the circle. See Partner::spiralProgress.
+  if(p.searching && p.search.spiral())
+  {
+    p.spiralProgress = std::min(1.0, p.spiralProgress + dt_ / p.search.spiralTime);
+  }
+
   if(p.searchEnvelope <= 0.0)
   {
     p.searchPhase = 0.0;
@@ -894,7 +912,11 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
   // the search has to cover every lateral direction. Phase is integrated rather than computed
   // from the clock so that starting, stopping and restarting cannot jump it.
   p.searchPhase += 2.0 * M_PI * p.search.frequency * dt_;
-  const double radius = p.search.amplitude * p.searchEnvelope;
+  // For the fixed circle the amplitude *is* the radius, reached once and orbited. For the
+  // spiral it is the outer radius and the search works out to it, so every radius below it is
+  // swept on the way -- which is what lets it cross a hole whose distance it does not know.
+  const double reach = p.search.spiral() ? p.spiralProgress : 1.0;
+  const double radius = p.search.amplitude * reach * p.searchEnvelope;
   p.searchOffset = Eigen::Vector3d(radius * std::cos(p.searchPhase), radius * std::sin(p.searchPhase), 0.0);
   return p.searchOffset;
 }
@@ -921,6 +943,7 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
     p.searching = false;
     p.searchPhase = 0.0;
     p.searchEnvelope = 0.0;
+    p.spiralProgress = 0.0;
     p.searchOffset.setZero();
   }
   // Re-seeded on the first tick of the episode from the pose that tick measures.
