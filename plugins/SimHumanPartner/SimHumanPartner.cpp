@@ -864,6 +864,18 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
   // space -- which it did, from the moment the transit arrived over the peg with the hole
   // still 240 mm up, because the old gate was proximity plus a stall detector that a stale
   // read had latched permanently.
+  //
+  // `!everInserted_` is load-bearing, and not merely tidiness about stopping the wiggle once
+  // the peg is in. It is what fixes *what this mechanism claims to model*. Because the search
+  // can never fire again after the piece has entered, it is incapable of representing a jam:
+  // 94.8 % of its life is spent with the piece resting on the plate about 8.5 mm short of the
+  // tip, and the 3.6 % past the tip is all at the 99th percentile and above -- the envelope
+  // decaying while a successful insertion drops in. So the modelled behaviour is a person who
+  // has set a plate down on a surface and slides it around until it drops, not one vibrating a
+  // stuck peg free. That is what makes a 17 mm sweep defensible: it is scaled to the
+  // registration uncertainty being hunted through, not to a jammed contact.
+  //
+  // Relaxing this term to handle partial insertions would take the justification with it.
   const bool inContact = resistance > p.search.contactForce;
   p.searching = inContact && pieceStuck_ && !everInserted_;
 
