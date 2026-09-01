@@ -169,23 +169,29 @@ private:
      * `amplitude` 0 disables it, so a config written before this existed is unchanged. */
     struct Search
     {
-      double amplitude = 0.0;       // m, radius of the lateral circle; 0 = off
-      double frequency = 1.5;       // Hz
-      double stallTime = 1.5;       // s without progress before deciding we are stuck
-      double stallProgress = 0.001; // m of extra depth that counts as progress
-      /** Only search when the hole is already near the peg.
+      double amplitude = 0.0; // m, radius of the lateral circle; 0 = off
+      double frequency = 1.5; // Hz
+      /** N of resistance this person must feel before searching at all.
        *
-       * Wiggling while still travelling would corrupt the reach, and a dyad that is 100 mm
-       * away is not stuck, it is on its way. */
-      double lateralRadius = 0.015; // m
+       * A person wiggles a piece because it is *against* something. Free-space motion is not
+       * a reason to wiggle however long it lasts, and the piece being near the peg is not
+       * either -- the corner of the L sits directly over the peg by construction, so a
+       * proximity test opens 240 mm too high.
+       *
+       * The resistance is this partner's own spring stretch against the plan,
+       * `stiffness * (planned reference - aimed point)`, which is what the person's hand
+       * feels. Deliberately computed from the *undithered* plan: the dither displaces the
+       * reference by a whole amplitude, so including it would let the search hold itself on. */
+      double contactForce = 2.0;
+      double stallTime = 0.5;      // s without the piece moving before deciding it is stuck
+      double stallMotion = 0.001; // m the piece must travel to count as still going in
       bool enabled() const { return amplitude > 0.0; }
     };
     Search search;
 
     // Live search state, reset every episode by startRecording.
-    double bestDepth = 0.0;        // deepest the hole has got this episode, m
-    double lastProgressTime = 0.0; // episode time when bestDepth last improved, s
-    bool searching = false;        // is the stuck condition true right now
+    double resistance = 0.0; // N this person is feeling against the plan, logged
+    bool searching = false;  // is the stuck condition true right now
     double searchPhase = 0.0;      // rad, integrated so a frequency change cannot step the output
     /** 0..1, ramped in and out over one period.
      *
@@ -271,11 +277,40 @@ private:
   void updateEpisode(mc_control::MCGlobalController & controller);
   /** Rebase every partner's reach and open an episode. */
   void startRecording(CollabPegInHoleController & collab, const mc_rbdyn::Robot & robot);
-  /** Update one partner's stuck state and return the dither to add to its reference.
+  /** Whether the piece itself has stopped moving. One piece, so one verdict for both people.
    *
-   * Reads the insertion measures cached by `insertionDepth` earlier in the same tick, so it
-   * must be called from `before()` after `updateEpisode()`. */
-  Eigen::Vector3d searchOffset(Partner & partner);
+   * Seeded from the pose passed in rather than from a member, because the member a previous
+   * version read (`insertionDepthLog_`) is not written until later in the first tick of an
+   * episode: it still held the *previous* episode's final depth, which latched the stall
+   * detector permanently and left the wiggle gated on proximity alone. */
+  void updateStuck(const Eigen::Vector3d & piece);
+
+  /** Length of the boxcar the stall test averages the piece pose over, in ticks.
+   *
+   * One full search period of the widest circle anyone is drawing. Nobody searching means
+   * there is nothing to cancel, and the average collapses to the raw sample. */
+  size_t stallWindowTicks() const;
+  /** The dither to add to one partner's reference, given what that person is feeling.
+   *
+   * `resistance` is the partner's own spring stretch against the undithered plan, in N. */
+  Eigen::Vector3d searchOffset(Partner & partner, double resistance);
+
+  // Is the piece sitting still? Shared, because it is a property of the piece and not of
+  // either person. Reset by startRecording, which is the only thing that may seed them.
+  Eigen::Vector3d stuckOrigin_ = Eigen::Vector3d::Zero();
+  double lastMotionTime_ = 0.0;
+  bool stuckSeeded_ = false;
+  bool pieceStuck_ = false;
+
+  // The stall test reads the piece pose averaged over one search period, never the raw pose.
+  // The dither is a circle, so a boxcar of exactly one period integrates it to zero while
+  // genuine drift survives. Without this the search cancels its own gate: a circle wide enough
+  // to move the piece past stallMotion clears pieceStuck_, which collapses the envelope before
+  // it reaches full amplitude. Measured, that capped the achieved radius near 10 mm however
+  // much was asked for -- 8 mm arrived at 97 % of command, 16 mm at 59 %, 24 mm at 41 % -- and
+  // made a stronger wiggle un-testable.
+  std::deque<Eigen::Vector3d> stuckWindow_;
+  Eigen::Vector3d stuckWindowSum_ = Eigen::Vector3d::Zero();
 
   // Last evaluated insertion measures, kept only so the success decision is auditable in the
   // log rather than being a verdict with no evidence behind it.

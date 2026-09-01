@@ -182,9 +182,9 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
       auto s = entry("search");
       s("amplitude", p.search.amplitude);
       s("frequency", p.search.frequency);
+      s("contact_force", p.search.contactForce);
       s("stall_time", p.search.stallTime);
-      s("stall_progress", p.search.stallProgress);
-      s("lateral_radius", p.search.lateralRadius);
+      s("stall_motion", p.search.stallMotion);
       if(p.search.amplitude < 0.0)
       {
         mc_rtc::log::error_and_throw<std::runtime_error>(
@@ -244,10 +244,10 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
                       p.name, p.body, p.stiffness.x(), p.damping.x(), p.delay * 1000.0);
     if(p.search.enabled())
     {
-      mc_rtc::log::info("[SimHumanPartner] '{}' searches when stuck: {:.1f} mm at {:.1f} Hz after "
-                        "{:.1f} s without {:.1f} mm of progress, within {:.0f} mm of the peg",
-                        p.name, p.search.amplitude * 1000.0, p.search.frequency, p.search.stallTime,
-                        p.search.stallProgress * 1000.0, p.search.lateralRadius * 1000.0);
+      mc_rtc::log::info("[SimHumanPartner] '{}' searches when stuck: {:.1f} mm at {:.1f} Hz once it "
+                        "feels {:.1f} N and the piece has not moved {:.1f} mm in {:.1f} s",
+                        p.name, p.search.amplitude * 1000.0, p.search.frequency, p.search.contactForce,
+                        p.search.stallMotion * 1000.0, p.search.stallTime);
     }
   }
 }
@@ -548,6 +548,9 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
   // whether the peg was placed somewhere the arm can reach it by descending, and that is
   // read off the log before any episode runs.
   insertionWorldLog_ = insertionWorld(robot);
+  // Before the partner loop, so every partner reads the same verdict from a pose measured
+  // this tick.
+  updateStuck(insertionWorldLog_);
   const std::string key = robot_ + "::ApplyWrenchOnBody";
   const bool haveCallback = ctl.datastore().has(key);
 
@@ -564,14 +567,6 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
     // Evaluating the intent in the past is the whole of the sensorimotor delay model: the
     // partner acts on where it meant to be a reaction time ago, not on where it is now.
     referenceAt(p, clock - p.delay, xRef, vRef);
-    // Added to the intent, deliberately: `reference` is what is logged, extracted and cloned,
-    // so a correction applied to the force instead would be invisible to a policy that
-    // imitates intent. Only while recording -- searchOffset() reads this episode's insertion
-    // measures, which are only computed then.
-    if(acting && phase_ == Phase::Recording)
-    {
-      xRef += searchOffset(p);
-    }
 
     // The error is measured at the point the person is aiming, which is the point they push
     // through -- anchoring the spring anywhere else makes it blind to the motion it causes.
@@ -579,6 +574,18 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
     Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
     Eigen::Vector3d handVel = Eigen::Vector3d::Zero();
     aimedPoint(robot, p, handPos, handVel);
+
+    // What this person's hand feels, from the plan alone. Read before the dither is added so
+    // that the search cannot hold itself on through its own displacement of the reference.
+    p.resistance = p.stiffness.cwiseProduct(xRef - handPos).norm();
+
+    // Added to the intent, deliberately: `reference` is what is logged, extracted and cloned,
+    // so a correction applied to the force instead would be invisible to a policy that
+    // imitates intent.
+    if(acting && phase_ == Phase::Recording)
+    {
+      xRef += searchOffset(p, p.resistance);
+    }
 
     if(!acting)
     {
@@ -785,7 +792,63 @@ void SimHumanPartner::updateEpisode(mc_control::MCGlobalController & controller)
   }
 }
 
-Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p)
+size_t SimHumanPartner::stallWindowTicks() const
+{
+  double period = 0.0;
+  for(const auto & p : partners_)
+  {
+    if(p.search.enabled() && p.search.frequency > 0.0)
+    {
+      period = std::max(period, 1.0 / p.search.frequency);
+    }
+  }
+  return period > 0.0 ? static_cast<size_t>(std::lround(period / dt_)) : 1;
+}
+
+void SimHumanPartner::updateStuck(const Eigen::Vector3d & piece)
+{
+  // Average over one search period before deciding anything, so that the dither this plugin
+  // is itself adding cannot register as the piece going somewhere. See stuckWindow_.
+  const size_t window = stallWindowTicks();
+  stuckWindow_.push_back(piece);
+  stuckWindowSum_ += piece;
+  while(stuckWindow_.size() > window)
+  {
+    stuckWindowSum_ -= stuckWindow_.front();
+    stuckWindow_.pop_front();
+  }
+  const Eigen::Vector3d smooth = stuckWindowSum_ / static_cast<double>(stuckWindow_.size());
+
+  // Seeded here, from a pose handed in by the caller. Never from a member updated later in
+  // the tick: on the first tick of an episode those still hold the previous episode's values.
+  if(!stuckSeeded_)
+  {
+    stuckOrigin_ = smooth;
+    lastMotionTime_ = episodeTime_;
+    stuckSeeded_ = true;
+  }
+  // Displacement from where it last was, not depth: a piece grinding sideways against a
+  // chamfer is going somewhere, and a piece that has stopped has stopped whatever the
+  // direction of travel was. Depth also cannot be used as the progress measure while the
+  // hole is still above the peg tip, which is most of the episode.
+  // One piece, so one threshold: take the first partner's rather than inventing a plugin-level
+  // duplicate of a number that already has a home in the config.
+  if(partners_.empty())
+  {
+    pieceStuck_ = false;
+    return;
+  }
+  const Partner::Search & spec = partners_.front().search;
+  if((smooth - stuckOrigin_).norm() > spec.stallMotion)
+  {
+    stuckOrigin_ = smooth;
+    lastMotionTime_ = episodeTime_;
+  }
+  const double quiet = spec.stallTime;
+  pieceStuck_ = episodeTime_ - lastMotionTime_ > quiet;
+}
+
+Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
 {
   const double ramp = p.search.enabled() ? dt_ * p.search.frequency : 0.0;
   if(!p.search.enabled())
@@ -796,17 +859,13 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p)
     return p.searchOffset;
   }
 
-  // Stuck means all three: we are at the peg rather than still travelling, we have never got
-  // it in, and the depth has not improved for a while. Dropping any one of them makes the
-  // dither fire during the reach, or keep firing after the peg is seated.
-  if(insertionDepthLog_ > p.bestDepth + p.search.stallProgress)
-  {
-    p.bestDepth = insertionDepthLog_;
-    p.lastProgressTime = episodeTime_;
-  }
-  const bool atPeg = insertionLateralLog_ < p.search.lateralRadius;
-  const bool stalled = episodeTime_ - p.lastProgressTime > p.search.stallTime;
-  p.searching = atPeg && !everInserted_ && stalled;
+  // Stuck means all three: this person is pushing against something, the piece has stopped
+  // moving, and it has never gone in. Dropping the contact term makes the dither fire in free
+  // space -- which it did, from the moment the transit arrived over the peg with the hole
+  // still 240 mm up, because the old gate was proximity plus a stall detector that a stale
+  // read had latched permanently.
+  const bool inContact = resistance > p.search.contactForce;
+  p.searching = inContact && pieceStuck_ && !everInserted_;
 
   // Ramp over one period rather than switching, so the reference is continuous in both
   // directions: a step of a whole amplitude is a kick the impedance turns into a force spike,
@@ -846,15 +905,17 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
   }
   for(auto & p : partners_)
   {
-    // Not zero: the hole starts above the peg tip, so depth starts negative and the first
-    // tick would otherwise count as progress and reset the stall clock.
-    p.bestDepth = -std::numeric_limits<double>::infinity();
-    p.lastProgressTime = 0.0;
+    p.resistance = 0.0;
     p.searching = false;
     p.searchPhase = 0.0;
     p.searchEnvelope = 0.0;
     p.searchOffset.setZero();
   }
+  // Re-seeded on the first tick of the episode from the pose that tick measures.
+  stuckSeeded_ = false;
+  pieceStuck_ = false;
+  stuckWindow_.clear();
+  stuckWindowSum_.setZero();
   collab.startEpisode();
   episodeTime_ = 0.0;
   seatedDepth_ = 0.0;
@@ -886,6 +947,7 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
   logger.addLogEntry("sim_human_target", [this]() -> const Eigen::Vector3d & { return target_; });
   logger.addLogEntry("sim_human_insertion_depth", [this]() { return insertionDepthLog_; });
   logger.addLogEntry("sim_human_insertion_lateral", [this]() { return insertionLateralLog_; });
+  logger.addLogEntry("sim_human_piece_stuck", [this]() { return pieceStuck_; });
   // The graded outcome and its timing. Logged per tick like everything else, so the value at
   // the episode's last tick is the episode's value -- which is what extract_episodes.py and
   // run_batch.py both read. Held flat after the peg is seated, deliberately: an episode that
@@ -923,6 +985,9 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
     // The search, logged whether or not it is enabled: an episode where nobody wiggled and one
     // where the feature was compiled out have to be distinguishable in the dataset.
     logger.addLogEntry(prefix + "_searching", [this, i]() { return partners_[i].searching; });
+    // The trigger's own input, so "why did it wiggle there" is answerable from the log rather
+    // than by reconstructing a spring from poses afterwards.
+    logger.addLogEntry(prefix + "_resistance", [this, i]() { return partners_[i].resistance; });
     logger.addLogEntry(prefix + "_search_offset",
                        [this, i]() -> const Eigen::Vector3d & { return partners_[i].searchOffset; });
   }
