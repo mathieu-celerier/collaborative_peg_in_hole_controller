@@ -184,6 +184,7 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
       s("frequency", p.search.frequency);
       s("contact_force", p.search.contactForce);
       s("stall_time", p.search.stallTime);
+      s("hold_time", p.search.holdTime);
       s("stall_motion", p.search.stallMotion);
       s("spiral_time", p.search.spiralTime);
       if(p.search.amplitude < 0.0)
@@ -249,6 +250,15 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
                         "feels {:.1f} N and the piece has not moved {:.1f} mm in {:.1f} s",
                         p.name, p.search.amplitude * 1000.0, p.search.frequency, p.search.contactForce,
                         p.search.stallMotion * 1000.0, p.search.stallTime);
+      if(p.search.holds())
+      {
+        // Worth a line of its own: it is the difference between the configured amplitude and
+        // the amplitude that actually gets drawn.
+        mc_rtc::log::info("[SimHumanPartner] '{}' holds the search {:.1f} s across a stall dropout "
+                          "(the envelope needs {:.1f} s of continuous searching to reach {:.1f} mm)",
+                          p.name, p.search.holdTime, 1.0 / std::max(p.search.frequency, 1e-6),
+                          p.search.amplitude * 1000.0);
+      }
     }
   }
 }
@@ -885,7 +895,22 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
   //
   // Relaxing this term to handle partial insertions would take the justification with it.
   const bool inContact = resistance > p.search.contactForce;
-  p.searching = inContact && pieceStuck_ && !everInserted_;
+
+  // `hold_time` bridges a dropout of the stall term only. The search displaces the piece, so
+  // it clears its own stuck test and cuts itself off after a median 0.77 s -- every observed
+  // interruption is this term, and each gap is exactly `stallTime` long. Without the bridge
+  // the envelope never gets the continuous 1/frequency seconds it needs to reach the
+  // commanded radius, and the configured shape is simply not what gets drawn.
+  //
+  // Contact and `everInserted_` are deliberately outside the hold: they still cut the search
+  // on the tick they go false. See Search::holdTime.
+  const bool stuckNow = pieceStuck_ && inContact && !everInserted_;
+  if(stuckNow && p.search.holds())
+  {
+    p.searchHoldUntil = episodeTime_ + p.search.holdTime;
+  }
+  const bool held = p.search.holds() && p.searchHoldUntil >= 0.0 && episodeTime_ < p.searchHoldUntil;
+  p.searching = (pieceStuck_ || held) && inContact && !everInserted_;
 
   // Ramp over one period rather than switching, so the reference is continuous in both
   // directions: a step of a whole amplitude is a kick the impedance turns into a force spike,
@@ -945,6 +970,7 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
     p.searchEnvelope = 0.0;
     p.spiralProgress = 0.0;
     p.searchOffset.setZero();
+    p.searchHoldUntil = -1.0;
   }
   // Re-seeded on the first tick of the episode from the pose that tick measures.
   stuckSeeded_ = false;

@@ -201,8 +201,31 @@ private:
        * 6.4 s of searching in total, so a spiral much slower than that never reaches its
        * outer radius before the episode ends. */
       double spiralTime = 0.0;
+      /** Seconds the search keeps running across a dropout of the *stall* term alone.
+       *
+       * The search moves the piece, so it clears its own stuck test and stops itself. The
+       * smoothing window on `stuckWindow_` was meant to absorb that and only half does:
+       * measured over 193 gaps on the 24 mm arm, **100 % of the interruptions are the stall
+       * term clearing** -- not the contact term, which never once dropped -- and every gap is
+       * exactly `stallTime` long, because that is how long re-arming takes.
+       *
+       * The cost is not the lost time, it is the lost amplitude. `searchEnvelope` ramps at
+       * `frequency`, so a fixed circle needs 1/0.25 = 4 s of continuous searching to reach the
+       * radius it was asked for, and the flag holds for a median 0.77 s before dropping for
+       * 0.50 s. The envelope ratchets up across the short gaps rather than resetting, but only
+       * to a median 12 mm of a commanded 24 mm, with 21 % of bursts reaching 90 %. So neither
+       * the circle nor the spiral is delivered at the width it was configured with.
+       *
+       * This bridges only the stall term. `contactForce` and `everInserted_` still cut the
+       * search immediately, which matters: the second of those is what limits this mechanism
+       * to modelling a piece being slid around on a surface rather than a jam, and holding the
+       * search through an insertion would take that justification with it.
+       *
+       * 0 disables the hold and reproduces every dataset generated before it existed. */
+      double holdTime = 0.0;
       bool enabled() const { return amplitude > 0.0; }
       bool spiral() const { return spiralTime > 0.0; }
+      bool holds() const { return holdTime > 0.0; }
     };
     Search search;
 
@@ -229,6 +252,11 @@ private:
      * radius that resets per burst never leaves the middle of the circle. */
     double spiralProgress = 0.0;
     Eigen::Vector3d searchOffset = Eigen::Vector3d::Zero(); // what was added this tick, m
+    /** Episode time until which the stall term is held true, or -1 when nothing is held.
+     *
+     * Set when the search *starts*, and extended for as long as the stuck test keeps
+     * confirming itself; what it bridges is the gap after the test stops confirming. */
+    double searchHoldUntil = -1.0;
 
     // Live state, for logging and the GUI.
     Eigen::Vector3d reference = Eigen::Vector3d::Zero();
