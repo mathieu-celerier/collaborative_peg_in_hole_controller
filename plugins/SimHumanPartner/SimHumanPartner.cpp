@@ -187,7 +187,15 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
       s("hold_time", p.search.holdTime);
       s("stall_motion", p.search.stallMotion);
       s("spiral_time", p.search.spiralTime);
-      if(p.search.amplitude < 0.0)
+      s("ramp_time", p.search.rampTime);
+      if(p.search.rampTime < 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a negative search ramp_time. Use 0 to keep the "
+            "rate coupled to frequency; a negative ramp inverts the envelope.",
+            p.name);
+      }
+            if(p.search.amplitude < 0.0)
       {
         mc_rtc::log::error_and_throw<std::runtime_error>(
             "[SimHumanPartner] partner '{}' has a negative search amplitude. Use 0 to disable "
@@ -254,10 +262,16 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
       {
         // Worth a line of its own: it is the difference between the configured amplitude and
         // the amplitude that actually gets drawn.
+        const double rampSeconds =
+            p.search.rampsExplicitly()
+                ? p.search.rampTime
+                : 1.0 / (std::max(p.search.frequency, 1e-6) * (p.search.spiral() ? 4.0 : 1.0));
         mc_rtc::log::info("[SimHumanPartner] '{}' holds the search {:.1f} s across a stall dropout "
-                          "(the envelope needs {:.1f} s of continuous searching to reach {:.1f} mm)",
-                          p.name, p.search.holdTime, 1.0 / std::max(p.search.frequency, 1e-6),
-                          p.search.amplitude * 1000.0);
+                          "(the envelope needs {:.2f} s of continuous searching to reach {:.1f} mm, "
+                          "and a full turn takes {:.2f} s, so a constant radius needs a burst "
+                          "longer than {:.2f} s)",
+                          p.name, p.search.holdTime, rampSeconds, p.search.amplitude * 1000.0,
+                          1.0 / std::max(p.search.frequency, 1e-6), 2.0 * rampSeconds);
       }
     }
   }
@@ -861,14 +875,21 @@ void SimHumanPartner::updateStuck(const Eigen::Vector3d & piece)
 
 Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
 {
-  // The spiral ramps four times faster than the fixed circle, and can afford to: its radius
-  // is amplitude * spiralProgress, which starts near zero, so its early bursts are gentle
-  // however quickly the envelope moves. It also has to be faster. The median burst lasts
-  // 0.48-0.56 s, so a full-period ramp leaves every one of them at roughly a seventh of the
-  // radius it asked for -- which is exactly what the fixed circle was measured doing, 1-5 mm
-  // of piece motion for an 8-48 mm command.
-  const double ramp =
-      p.search.enabled() ? dt_ * p.search.frequency * (p.search.spiral() ? 4.0 : 1.0) : 0.0;
+  // By default the spiral ramps four times faster than the fixed circle, and can afford to:
+  // its radius is amplitude * spiralProgress, which starts near zero, so its early bursts are
+  // gentle however quickly the envelope moves. It also had to be faster back when the median
+  // burst lasted 0.48-0.56 s and a full-period ramp left every one of them at roughly a
+  // seventh of the radius it asked for. `hold_time` has since made bursts 6.2 s, so that
+  // argument no longer carries on its own -- see Search::rampTime, which is how the ramp gets
+  // set without also moving the orbit speed.
+  // `ramp_time`, when set, is the whole of the rate: the envelope crosses its range in that
+  // many seconds whatever the orbit speed or the shape. Left at 0 this is arithmetically the
+  // legacy expression, which is what keeps every dataset generated before it reproducible.
+  const double rampSeconds =
+      p.search.rampsExplicitly()
+          ? p.search.rampTime
+          : 1.0 / (std::max(p.search.frequency, 1e-6) * (p.search.spiral() ? 4.0 : 1.0));
+  const double ramp = p.search.enabled() ? dt_ / std::max(rampSeconds, dt_) : 0.0;
   if(!p.search.enabled())
   {
     p.searching = false;

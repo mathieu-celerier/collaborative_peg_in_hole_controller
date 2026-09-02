@@ -223,9 +223,29 @@ private:
        *
        * 0 disables the hold and reproduces every dataset generated before it existed. */
       double holdTime = 0.0;
+      /** Seconds for `searchEnvelope` to travel its full range, in or out. 0 keeps the legacy
+       * coupling, which is `1 / frequency` for the circle and a quarter of that for the spiral.
+       *
+       * Splitting this off matters because the two are not the same knob and the legacy rate
+       * conflates them. The envelope ramping over exactly one period means the phase advances
+       * exactly one full turn while the radius grows, so the "fixed circle" traces a spiral out
+       * and a spiral back in, and holds a constant radius only in whatever burst time is left
+       * over. Measured across 800 episodes at 0.25 Hz that is 16 % of search time: a plateau
+       * needs a burst longer than 2/frequency = 8 s, and the median burst is 6.2 s.
+       *
+       * Raising `frequency` shortens the ramp *and* speeds the orbit together, so it cannot say
+       * which of the two an effect came from. `rampTime` holds the orbit speed fixed and moves
+       * only the ramp.
+       *
+       * It also symmetrises the spiral. The legacy 4x applies to the decay as well as the
+       * climb, so the spiral climbs over `spiralTime` and is cut off in a quarter period; that
+       * asymmetry does not cancel, and leaves a mean offset of 1.7 mm per burst against a
+       * 1.5 mm seating radius, where the circle's symmetric ramps cancel to 0.8 mm. */
+      double rampTime = 0.0;
       bool enabled() const { return amplitude > 0.0; }
       bool spiral() const { return spiralTime > 0.0; }
       bool holds() const { return holdTime > 0.0; }
+      bool rampsExplicitly() const { return rampTime > 0.0; }
     };
     Search search;
 
