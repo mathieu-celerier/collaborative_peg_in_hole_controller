@@ -165,8 +165,12 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * the policy rate, `intentForce` every control tick: an impedance evaluated only when a new
    * prediction arrives is a constant push between predictions, not a spring, and would not
    * react to the arm moving under it in the 9 ms in between.
+   *
+   * `policy.max_intent_speed` is applied here, on the way in: what the impedance closes on is
+   * the prediction, or the furthest point towards it a hand could have reached in one policy
+   * step. See `policyMaxIntentSpeed_`.
    */
-  void updateIntentReference(const Eigen::Vector3d & intent);
+  void updateIntentReference(const Eigen::Vector3d & predicted);
   Eigen::Vector3d intentForce();
 
   // Frames / sensors (configurable per robot module).
@@ -230,6 +234,16 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * 1.0 is the raw difference. The policy's prediction error lands directly in this
    * derivative, so some smoothing is not optional. */
   double policyVelocityFilter_ = 0.2;
+  /** Ceiling on how fast the predicted intent point may travel, in m/s. 0 disables it, which
+   * is what an unset config gets, so this changes nothing until it is asked for.
+   *
+   * The demonstrating partner's own intent is a min-jerk plan and moves at most 0.181 m/s
+   * (measured over dataset-train8's 540 episodes, p99 0.124). A prediction has no such
+   * bound: a chunk that lands far from the last one moves the spring's anchor by that whole
+   * distance in one policy step, and the impedance answers with a force whose only limit is
+   * `max_force`. Limiting the step keeps the direction the policy asked for and spends more
+   * ticks getting there -- which is what the hand it is imitating would have done. */
+  double policyMaxIntentSpeed_ = 0.0;
   Eigen::Vector3d policyIntent_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d lastIntent_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d policyRefVelocity_ = Eigen::Vector3d::Zero();
@@ -238,6 +252,10 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * constantly is aiming somewhere the arm cannot follow, which reads as a control problem
    * and is a prediction problem. */
   bool policySaturated_ = false;
+  /** Whether the rate limit above shortened the intent's step this tick. Logged for the same
+   * reason as `policySaturated_`: a limiter that never fires explains nothing about a run,
+   * and one that fires on every tick has replaced the policy with a ramp. */
+  bool policyIntentLimited_ = false;
   /** The recorded intent replayed in place of a prediction, when `policy.replay` is set.
    *
    * Not a `PolicyBackend`: it observes nothing. It substitutes for exactly one thing -- the

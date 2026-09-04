@@ -188,6 +188,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("reference_body", policyRefBody_);
     pconfig("reference_point", policyRefPoint_);
     pconfig("velocity_filter", policyVelocityFilter_);
+    pconfig("max_intent_speed", policyMaxIntentSpeed_);
     pconfig("log_observation", logPolicyObservation_);
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
@@ -304,6 +305,13 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
           mc_rtc::log::error_and_throw("[CollabPegInHoleController] policy.velocity_filter must be in (0, 1], got {}",
                                        policyVelocityFilter_);
         }
+        if(policyMaxIntentSpeed_ < 0.0)
+        {
+          mc_rtc::log::error_and_throw(
+              "[CollabPegInHoleController] policy.max_intent_speed is a speed in m/s and cannot be negative, got {}. "
+              "Leave it out, or set it to 0, to run the intent unlimited.",
+              policyMaxIntentSpeed_);
+        }
       }
       mc_rtc::log::info("[CollabPegInHoleController] policy partner '{}' active ({} output), evaluated every {} "
                         "ticks ({:.0f} Hz)",
@@ -321,9 +329,12 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       if(policyOutputKind_ == "intent")
       {
         mc_rtc::log::info("[CollabPegInHoleController]   impedance kp [{:.1f}] kd [{:.1f}] max {:.1f} N about "
-                          "'{}', reference velocity filtered at {:.2f}",
+                          "'{}', reference velocity filtered at {:.2f}, intent {}",
                           policyStiffness_.x(), policyDamping_.x(), policyMaxForce_, policyRefBody_,
-                          policyVelocityFilter_);
+                          policyVelocityFilter_,
+                          policyMaxIntentSpeed_ > 0.0
+                              ? fmt::format("limited to {:.3f} m/s", policyMaxIntentSpeed_)
+                              : std::string("unlimited"));
       }
     }
   }
@@ -1102,9 +1113,34 @@ void CollabPegInHoleController::aimedPoint(const mc_rbdyn::Robot & robot,
   velocity = V_0_b.linear() + V_0_b.angular().cross(offsetW);
 }
 
-void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & intent)
+void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & predicted)
 {
   const double interval = timeStep * policyDecimation_;
+  // Where the intent is allowed to be, which is the prediction unless it asks to move faster
+  // than a hand does. The direction is kept and only the distance is spent, so a limited step
+  // is still heading where the policy asked -- it just takes more policy steps to arrive.
+  //
+  // This is the policy channel's version of conditionExternalTorques(): the same argument,
+  // that a magnitude the arm cannot answer empties the QP's constraint set, applied to the
+  // one input that reaches the solver without passing through it. Off by default.
+  Eigen::Vector3d intent = predicted;
+  policyIntentLimited_ = false;
+  // `haveLastIntent_` gates it: the first prediction of an episode has nothing to be a step
+  // from, and limiting it against a stale anchor would drag the partner back towards where
+  // the previous episode ended. That first point can still stretch the spring arbitrarily far
+  // -- which is what `max_force` is for. The two bounds cover different halves of the
+  // problem, and neither substitutes for the other.
+  if(policyMaxIntentSpeed_ > 0.0 && haveLastIntent_)
+  {
+    const Eigen::Vector3d step = intent - lastIntent_;
+    const double reach = policyMaxIntentSpeed_ * interval;
+    const double asked = step.norm();
+    if(asked > reach)
+    {
+      intent = lastIntent_ + step * (reach / asked);
+      policyIntentLimited_ = true;
+    }
+  }
   // The derivative of a prediction, so it carries the prediction's error: filtered, and the
   // first step taken as zero rather than as a step from an arbitrary initial value.
   const Eigen::Vector3d raw = haveLastIntent_ ? Eigen::Vector3d((intent - lastIntent_) / interval)
@@ -1152,6 +1188,7 @@ void CollabPegInHoleController::updatePolicyPartner()
     policyRefVelocity_.setZero();
     haveLastIntent_ = false;
     policySaturated_ = false;
+    policyIntentLimited_ = false;
     // The anchor is per-episode: it is taken again, from wherever the next episode's hand
     // starts, exactly as SimHumanPartner rebases its own plan at each episode start.
     haveReplayAnchor_ = false;
@@ -1608,6 +1645,10 @@ void CollabPegInHoleController::addLog()
                          return (policyIntent_ - position).norm();
                        });
   logger().addLogEntry("collab_policy_saturated", this, [this]() -> double { return policySaturated_ ? 1.0 : 0.0; });
+  // The rate limit's own activity. Read it beside `collab_policy_saturated`: a bounded run in
+  // which neither ever fires is the unbounded run, whatever the config said.
+  logger().addLogEntry("collab_policy_intent_limited", this,
+                       [this]() -> double { return policyIntentLimited_ ? 1.0 : 0.0; });
   if(remote_)
   {
     // The number that decides whether a run is a result. A starved tick is one where the
@@ -1623,6 +1664,10 @@ void CollabPegInHoleController::addLog()
     // than that means the server is slower than a whole chunk and the run is not usable.
     logger().addLogEntry("collab_policy_discarded", this,
                          [this]() -> double { return remote_ ? static_cast<double>(remote_->discarded()) : 0.0; });
+    // Chunks dropped for carrying a non-finite action. Any at all means the server produced a
+    // NaN, which is a fault in the checkpoint or the observation, not a hard state.
+    logger().addLogEntry("collab_policy_chunk_rejected", this,
+                         [this]() -> double { return remote_ ? static_cast<double>(remote_->rejected()) : 0.0; });
   }
   if(!policyReplayPath_.empty())
   {

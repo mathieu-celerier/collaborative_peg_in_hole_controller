@@ -10,7 +10,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 
 namespace collab
@@ -288,6 +290,21 @@ bool RemotePolicy::poll()
     // An answer to a question this episode did not ask. Dropped rather than applied: it was
     // computed from observations that are no longer true.
     ++discarded_;
+  }
+  else if(!std::all_of(values, values + static_cast<std::size_t>(rows) * cols,
+                       [](double v) { return std::isfinite(v); }))
+  {
+    // A NaN in the chunk is not a bad prediction, it is no prediction: it would reach the
+    // impedance as an infinite spring stretch and empty the QP's constraint set on the tick
+    // it arrives. Dropped like a stale reply, so `next()` holds the last action and the
+    // episode carries on with a partner that stopped moving -- which is a scoreable failure
+    // rather than an erased episode. `inFlight_` is cleared so the next step asks again.
+    ++rejected_;
+    if(rejected_ == 1)
+    {
+      mc_rtc::log::warning("[RemotePolicy] dropped a chunk carrying a non-finite action; holding the last one");
+    }
+    inFlight_ = false;
   }
   else
   {

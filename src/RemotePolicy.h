@@ -109,6 +109,11 @@ public:
   {
     return discarded_;
   }
+  /** Replies dropped for carrying a non-finite action. */
+  int rejected() const noexcept
+  {
+    return rejected_;
+  }
   int actionDim() const noexcept
   {
     return actionDim_;
@@ -178,6 +183,7 @@ private:
   bool inFlight_ = false;
   bool starved_ = false;
   int discarded_ = 0;
+  int rejected_ = 0;
   std::size_t refillAt_ = 4;
 
   //: The reply as it accumulates. A reply arrives in whatever pieces the kernel chose, and a
