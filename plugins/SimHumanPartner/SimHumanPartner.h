@@ -286,6 +286,32 @@ private:
        * *ahead* of the plan drag it backwards. The default is enough slack for a learner
        * moving faster than the plan and far too little to cross a segment in a tick. */
       double maxAdvanceRate = 3.0;
+      /** Re-plan from the hand instead of aiming at the plan.
+       *
+       * The projection expert still aims *at* a fixed polyline, so its command carries the
+       * **cross-track** error whatever the lookahead does: `|ref - hand|` is bounded below by
+       * the distance from the hand to the path, and no choice of phase touches that term.
+       * Measured on drifted leader-A-stiff states, both experts commanded ~100 mm and implied
+       * ~50 N against a demonstrator that never exceeded 37.3 N.
+       *
+       * With this set, the reference is the plan's own displacement over the lookahead applied
+       * **from the hand**, plus a correction back onto the path clamped to `maxCorrection`. So
+       *
+       *     |ref - hand| <= (path speed x lookaheadTime) + maxCorrection
+       *
+       * holds by construction rather than by hope, and on-plan the two experts agree: with the
+       * hand at the projection the displacement term reproduces the projection expert exactly
+       * and the correction is zero. What changes is only what happens once a learner has
+       * strayed, which is the only place a DAgger label differs from a demonstration anyway. */
+      bool replan = false;
+      /** Metres of cross-track pull the re-planning expert may add. 0 leaves the label purely
+       * along-track, which is bounded but never steers a drifted learner back to the hole.
+       *
+       * Sized against the demonstrated stretch, not against the drift: person A's own
+       * `reference - hand` runs to 41.8 mm at the 95th percentile in the stiff cells, so a
+       * correction of that order keeps the label inside the distribution the policy is being
+       * asked to reproduce. */
+      double maxCorrection = 0.0;
       bool enabled() const { return lookaheadTime > 0.0; }
     };
     Feedback feedback;
@@ -404,6 +430,14 @@ private:
    *
    * `partner.labelClock` carries the monotone floor and is advanced by this call. */
   static double phaseFromState(Partner & partner, const Eigen::Vector3d & handPos, double dt);
+
+  /** The re-planning expert's reference: a plan re-anchored on the hand.
+   *
+   * See `Feedback::replan`. Not `const`, because it advances the partner's monotone phase
+   * exactly as the projection expert does.
+   */
+  static void replannedReference(Partner & partner, const Eigen::Vector3d & handPos, double dt,
+                                 Eigen::Vector3d & position, Eigen::Vector3d & velocity);
 
   /** Where a partner's aimed point is now, and how fast it is moving. World frame. */
   static void aimedPoint(const mc_rbdyn::Robot & robot, const Partner & partner, Eigen::Vector3d & position,
@@ -548,6 +582,27 @@ private:
   Eigen::Vector3d insertionPoint_ = Eigen::Vector3d::Zero(); // the hole centre, body frame
   int episodesRequested_ = 0;   // how many still to run; negative means "keep going"
   int episodesCompleted_ = 0;
+  /** Episodes an earlier launch of this cell already ran, when this one resumes it.
+   *
+   * A solver failure kills the simulator and every episode of the cell that had not run yet,
+   * because one process drives all of them. Resuming means launching again for the remainder,
+   * and the remainder has to be *the* remainder: the RNG is seeded once and consumed one draw
+   * per episode, so a fresh launch would replay the episodes that already exist -- including
+   * the one that killed it. This burns that many draws before the first episode, so episode
+   * k+1 gets exactly the noise it would have had in an uninterrupted run, and tells the
+   * controller to number from k+1.
+   *
+   * Consuming draws rather than re-seeding is deliberate: seed-matching is what makes every
+   * comparison in this project paired, and a resumed cell has to stay matched to the same cell
+   * in the arm it is being compared against.
+   *
+   * One caveat that is a property of resuming and not of this counter: episodes within a
+   * launch start from wherever the previous one left the arm, while a resumed launch starts
+   * from the home pose. A resumed episode is therefore not bit-identical to the one an
+   * uninterrupted run would have produced -- only identically *seeded*.
+   */
+  int resumeAfter_ = 0;
+  bool resumeApplied_ = false;
   double episodeTime_ = 0.0;    // seconds since the current episode started
   double t_ = 0.0;              // plugin clock, seconds since reset
   double dt_ = 0.001;

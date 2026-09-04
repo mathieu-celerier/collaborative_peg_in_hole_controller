@@ -82,6 +82,18 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * *sticky* outcome that covers the whole episode, `stopEpisode()` closes it. The extractor
    * (`scripts/extract_episodes.py`) segments on the `collab_recording` edges and reads
    * `collab_episode_outcome` to filter successful demonstrations. */
+  /** Continue numbering episodes after `id`, for a run that resumes a cell.
+   *
+   * A solver failure ends the simulator, and with it every episode of that cell that had not
+   * run yet -- one process drives all of them. Resuming means launching again for the
+   * remainder, and the episodes it records must not reuse the ids the first launch already
+   * wrote: `extract_episodes.py` names files from `collab_episode_id`, so a second launch
+   * starting at 1 would overwrite the episodes that survived.
+   *
+   * Called by SimHumanPartner from its `resume_after`, before the first `startEpisode()`.
+   */
+  void resumeEpisodesAt(int id);
+
   void startEpisode();
   void markEpisode(const std::string & label);
   void stopEpisode();

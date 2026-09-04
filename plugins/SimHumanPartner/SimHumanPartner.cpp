@@ -116,6 +116,45 @@ double SimHumanPartner::phaseFromState(Partner & partner, const Eigen::Vector3d 
   return partner.labelClock;
 }
 
+void SimHumanPartner::replannedReference(Partner & partner, const Eigen::Vector3d & handPos, double dt,
+                                         Eigen::Vector3d & position, Eigen::Vector3d & velocity)
+{
+  const double tau = phaseFromState(partner, handPos, dt);
+  Eigen::Vector3d atPhase = Eigen::Vector3d::Zero();
+  Eigen::Vector3d vAtPhase = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ahead = Eigen::Vector3d::Zero();
+  Eigen::Vector3d vAhead = Eigen::Vector3d::Zero();
+  referenceAt(partner, tau, atPhase, vAtPhase);
+  referenceAt(partner, tau + partner.feedback.lookaheadTime, ahead, vAhead);
+
+  // The plan's own displacement over the lookahead, applied from the hand rather than from the
+  // plan. This is the along-track term, and it is all that the projection expert was ever able
+  // to bound: `ahead - atPhase` is a distance the plan itself travels, so it cannot exceed
+  // (path speed x lookahead) no matter where the learner has got to.
+  position = handPos + (ahead - atPhase);
+
+  // The cross-track term, which is the one the projection expert could not bound because it
+  // aimed at the path: there `|ref - hand|` is at least the distance from the hand to the
+  // polyline. Here it is a separate, explicitly clamped addend, so a learner 300 mm off its
+  // plan is pulled back with the same force as one 50 mm off -- steadily, over many ticks,
+  // instead of with a command no hand in the demonstrations ever produced.
+  if(partner.feedback.maxCorrection > 0.0)
+  {
+    Eigen::Vector3d correction = atPhase - handPos;
+    const double reach = correction.norm();
+    if(reach > partner.feedback.maxCorrection)
+    {
+      correction *= partner.feedback.maxCorrection / reach;
+    }
+    position += correction;
+  }
+
+  // The plan's velocity at the lookahead, not the correction's: the correction is a position
+  // offset that the impedance's own damping should resist, and differentiating a clamped term
+  // would put a step into vRef every time the clamp engages.
+  velocity = vAhead;
+}
+
 void SimHumanPartner::aimedPoint(const mc_rbdyn::Robot & robot, const Partner & partner,
                                  Eigen::Vector3d & position, Eigen::Vector3d & velocity)
 {
@@ -237,12 +276,30 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
     {
       auto f = entry("feedback");
       f("lookahead_time", p.feedback.lookaheadTime);
+      f("replan", p.feedback.replan);
+      f("max_correction", p.feedback.maxCorrection);
       f("max_advance_rate", p.feedback.maxAdvanceRate);
       if(p.feedback.lookaheadTime < 0.0)
       {
         mc_rtc::log::error_and_throw<std::runtime_error>(
             "[SimHumanPartner] partner '{}' has a negative feedback lookahead_time. Use 0 to "
             "read the plan from the clock, which is the behaviour without this block at all.",
+            p.name);
+      }
+      if(p.feedback.maxCorrection < 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a negative feedback max_correction. It is a "
+            "ceiling in metres on the cross-track pull, not an offset; 0 leaves the label "
+            "purely along-track.",
+            p.name);
+      }
+      if(p.feedback.replan && !p.feedback.enabled())
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' asks for feedback replan with lookahead_time 0. "
+            "The re-planned reference IS the plan's displacement over the lookahead, so a zero "
+            "lookahead makes it aim at the hand and never advance.",
             p.name);
       }
     }
@@ -527,6 +584,13 @@ void SimHumanPartner::init(mc_control::MCGlobalController & controller, const mc
   robot_ = config("robot", controller.controller().robot().name());
   config("enabled", enabled_);
   config("auto_episodes", autoEpisodes_);
+  config("resume_after", resumeAfter_);
+  if(resumeAfter_ < 0)
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>(
+        "[SimHumanPartner] resume_after is a count of episodes an earlier launch already ran "
+        "and cannot be negative, got {}.", resumeAfter_);
+  }
   config("compliant_episodes", compliantEpisodes_);
   config("settle_time", settleTime_);
   config("home_time", homeTime_);
@@ -684,7 +748,14 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
       // Where the plan says to go next *from where this hand actually is*. No delay term: a
       // reaction time is a property of executing an answer, not of the answer, and a label
       // that lags the state it is labelling is the defect this exists to remove.
-      referenceAt(p, phaseFromState(p, handPos, dt_) + p.feedback.lookaheadTime, xRef, vRef);
+      if(p.feedback.replan)
+      {
+        replannedReference(p, handPos, dt_, xRef, vRef);
+      }
+      else
+      {
+        referenceAt(p, phaseFromState(p, handPos, dt_) + p.feedback.lookaheadTime, xRef, vRef);
+      }
     }
     else
     {
@@ -1064,6 +1135,24 @@ Eigen::Vector3d SimHumanPartner::searchOffset(Partner & p, double resistance)
 
 void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const mc_rbdyn::Robot & robot)
 {
+  // Burned before this cell's first episode, not per episode: see `resumeAfter_`. The draws
+  // are consumed for their side effect on the RNG, so that the episode about to run gets the
+  // noise it would have had if the launch that died had reached it.
+  if(!resumeApplied_)
+  {
+    resumeApplied_ = true;
+    if(resumeAfter_ > 0)
+    {
+      for(int i = 0; i < resumeAfter_; ++i)
+      {
+        drawEpisodeNoise();
+      }
+      collab.resumeEpisodesAt(resumeAfter_);
+      mc_rtc::log::info("[SimHumanPartner] resuming after {} episode(s): burned that many noise "
+                        "draws so this launch continues the sequence rather than replaying it",
+                        resumeAfter_);
+    }
+  }
   // Start each partner's reach from where its aimed point actually is, rather than from a
   // fixed world point: otherwise the first tick asks for a force no arm could apply and the
   // saturation limit is all that survives of the model. Relative partners are additionally

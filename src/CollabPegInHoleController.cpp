@@ -1385,6 +1385,18 @@ bool CollabPegInHoleController::postureCompliance() const
   return postureCompliant_;
 }
 
+void CollabPegInHoleController::resumeEpisodesAt(int id)
+{
+  if(id <= 0)
+  {
+    return;
+  }
+  episodeId_ = id;
+  datastore().assign<int>("EpisodeId", episodeId_);
+  mc_rtc::log::info("[CollabPegInHoleController] Resuming a cell: episodes will be numbered from {}",
+                    episodeId_ + 1);
+}
+
 void CollabPegInHoleController::startEpisode()
 {
   // A double press would otherwise abandon the running episode mid-stream, leaving a recording
