@@ -189,6 +189,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("reference_point", policyRefPoint_);
     pconfig("velocity_filter", policyVelocityFilter_);
     pconfig("max_intent_speed", policyMaxIntentSpeed_);
+    pconfig("relative_intent", policyRelativeIntent_);
     pconfig("log_observation", logPolicyObservation_);
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
@@ -335,6 +336,10 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
                           policyMaxIntentSpeed_ > 0.0
                               ? fmt::format("limited to {:.3f} m/s", policyMaxIntentSpeed_)
                               : std::string("unlimited"));
+        mc_rtc::log::info("[CollabPegInHoleController]   action space: {}",
+                          policyRelativeIntent_
+                              ? "RELATIVE -- the prediction is a displacement from this policy's own hand"
+                              : "absolute -- the prediction is a world point");
       }
     }
   }
@@ -1123,7 +1128,19 @@ void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & pr
   // This is the policy channel's version of conditionExternalTorques(): the same argument,
   // that a magnitude the arm cannot answer empties the QP's constraint set, applied to the
   // one input that reaches the solver without passing through it. Off by default.
+  // A relative policy predicts where its hand should go *from where its hand is*, so the
+  // reference is rebuilt here and everything below this line is unchanged. Reconstructing at
+  // this point rather than at the socket is deliberate: the rate limit, the impedance and the
+  // saturation then all see the same absolute reference they always did, and the two action
+  // spaces differ by exactly this addition.
   Eigen::Vector3d intent = predicted;
+  if(policyRelativeIntent_)
+  {
+    Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
+    Eigen::Vector3d handVel = Eigen::Vector3d::Zero();
+    aimedPoint(robot(), policyRefBody_, policyRefPoint_, handPos, handVel);
+    intent += handPos;
+  }
   policyIntentLimited_ = false;
   // `haveLastIntent_` gates it: the first prediction of an episode has nothing to be a step
   // from, and limiting it against a stale anchor would drag the partner back towards where

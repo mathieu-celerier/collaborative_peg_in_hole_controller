@@ -244,6 +244,23 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * `max_force`. Limiting the step keeps the direction the policy asked for and spends more
    * ticks getting there -- which is what the hand it is imitating would have done. */
   double policyMaxIntentSpeed_ = 0.0;
+  /** Whether the policy predicts a *displacement from its own hand* rather than a world
+   * point. False is the absolute action space every policy before this was trained in.
+   *
+   * The impedance consumes `reference - hand`, never the reference alone, so that difference
+   * is what the demonstrations actually contain: over dataset-train8 it is 4.5 mm median and
+   * 32 mm at its largest. An absolute action has no such bound -- the same quantity, measured
+   * on a drifted policy, ran to 300 mm and ~50 N, which is what empties the QP's constraint
+   * set. Predicting the difference makes the command small by construction, and the reference
+   * is rebuilt here as `hand + prediction`. Everything below that -- the rate limit, the
+   * impedance, the saturation -- is unchanged, so the two action spaces differ in exactly one
+   * line and stay comparable.
+   *
+   * One interaction to read the logs with: the reference now inherits the hand's own motion
+   * between policy steps, so `max_intent_speed` is measured against (hand speed + change in
+   * prediction) rather than the prediction alone, and `collab_policy_intent_limited` will
+   * fire more often here than in the absolute arm at the same ceiling. */
+  bool policyRelativeIntent_ = false;
   Eigen::Vector3d policyIntent_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d lastIntent_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d policyRefVelocity_ = Eigen::Vector3d::Zero();

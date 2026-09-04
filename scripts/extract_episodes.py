@@ -29,6 +29,9 @@ Each output holds, per timestep:
   target/<partner>_reference  where each partner's plan was asking that hand to be, world
                           frame -- the intent, and the second candidate action for a policy
                           (see PARTNER_REFERENCE_ENTRY)
+  target/<partner>_hand   where that partner's hand actually was, world frame. With the
+                          reference above, the spring the partner's force came out of
+                          (see PARTNER_HAND_ENTRY)
   target/<partner>_force  the world-frame force each simulated partner actually applied
                           (see PARTNER_FORCE_ENTRY) -- the label for a policy that replaces
                           that partner, and never an observation
@@ -129,6 +132,17 @@ PARTNER_FORCE_ENTRY = re.compile(r"^sim_human_(.+)_force$")
 # into a force. It is also the action space RoboManipBaselines takes natively
 # (COMMAND_EEF_POSE), where a wrench action needs its DataKey list patched.
 PARTNER_REFERENCE_ENTRY = re.compile(r"^sim_human_(.+)_reference$")
+
+# Where that partner's hand actually was, world frame -- the point the plugin measured its
+# reference against, `aimedPoint(referenceBody, referencePoint)`.
+#
+# Carried because the *difference* `reference - hand` is a third candidate action, and the
+# one the impedance actually consumes: the force is `K (reference - hand) + D (...)`, so a
+# policy predicting the difference predicts a bounded force by construction, where one
+# predicting the absolute reference can ask for any stretch at all. Deriving it afterwards
+# from `obs/tool_pose` needs a constant body-frame offset that is nowhere in the `.npz`, so
+# it is written down instead of reconstructed.
+PARTNER_HAND_ENTRY = re.compile(r"^sim_human_(.+)_hand$")
 
 # Metadata that is a vector rather than a scalar, so it needs `gather` rather than
 # `scalar_metadata`. Constant across an episode, hence metadata and not an observation.
@@ -292,6 +306,18 @@ def partner_reference_entries(data):
     return bases
 
 
+def partner_hand_entries(data):
+    """The `sim_human_<partner>_hand` entries, discovered the same way."""
+    bases = []
+    for key in data:
+        if not key.startswith("sim_human_"):
+            continue
+        base = key.rsplit("_", 1)[0]
+        if PARTNER_HAND_ENTRY.match(base) and base not in bases:
+            bases.append(base)
+    return bases
+
+
 def scalar_metadata(data, entry, index):
     """Read one metadata entry at a given sample (strings are logged per tick)."""
     if entry not in data:
@@ -447,6 +473,17 @@ def extract(episode, data, args):
     # construction, and averaging it would round the corners of the plan the policy is meant
     # to reproduce.
     for entry in partner_reference_entries(data):
+        values, columns = gather(data, entry)
+        if values is None:
+            continue
+        name = entry[len("sim_human_") :]
+        out["target/" + name] = decimate(values[sl], factor, False)
+        out["columns/" + name] = np.array(columns)
+
+    # Struck rather than averaged for the same reason as the reference: the difference of the
+    # two is the quantity of interest, and averaging one of a pair while striding the other
+    # would put a filter's lag into their difference.
+    for entry in partner_hand_entries(data):
         values, columns = gather(data, entry)
         if values is None:
             continue
