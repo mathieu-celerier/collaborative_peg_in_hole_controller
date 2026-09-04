@@ -248,11 +248,16 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * point. False is the absolute action space every policy before this was trained in.
    *
    * The impedance consumes `reference - hand`, never the reference alone, so that difference
-   * is what the demonstrations actually contain: over dataset-train8 it is 4.5 mm median and
-   * 32 mm at its largest. An absolute action has no such bound -- the same quantity, measured
-   * on a drifted policy, ran to 300 mm and ~50 N, which is what empties the QP's constraint
-   * set. Predicting the difference makes the command small by construction, and the reference
-   * is rebuilt here as `hand + prediction`. Everything below that -- the rate limit, the
+   * is what the demonstrations actually contain: in the cells where person A leads -- the ones
+   * the policy fails in -- it is 6.2 mm median and 60.9 mm at its largest, where a drifted
+   * policy commanded 92.9 mm median and 307 mm, ~50 N against a hand that never exceeded 37.3.
+   *
+   * The gain is distributional, not a hard bound, and the difference matters: the two `limits`
+   * normalisation boxes have near-identical diagonals (415 mm absolute, 408 relative), so
+   * `clip_sample` bounds neither more tightly than the other. What changes is what a typical
+   * output means -- in this space commanding 300 mm is far out in the policy's own output
+   * distribution, where an absolute world point 300 mm from the hand is unremarkable. The
+   * reference is rebuilt here as `hand + prediction`. Everything below that -- the rate limit, the
    * impedance, the saturation -- is unchanged, so the two action spaces differ in exactly one
    * line and stay comparable.
    *
