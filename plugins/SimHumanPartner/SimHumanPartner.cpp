@@ -60,6 +60,62 @@ void SimHumanPartner::referenceAt(const Partner & partner, double t, Eigen::Vect
   velocity.setZero();
 }
 
+double SimHumanPartner::phaseFromState(Partner & partner, const Eigen::Vector3d & handPos, double dt)
+{
+  if(partner.segments.empty())
+  {
+    return 0.0;
+  }
+
+  // Nearest point on the polyline. Segments are straight lines, so this is exact rather than
+  // a sampling: the closest point of a segment is the clamped scalar projection onto it.
+  double bestDistance = std::numeric_limits<double>::max();
+  double bestTime = partner.segments.front().start;
+  for(const auto & seg : partner.segments)
+  {
+    const Eigen::Vector3d delta = seg.to - seg.from;
+    const double length2 = delta.squaredNorm();
+    // A dwell: zero length, so every point of it projects to the same place. Its *time* still
+    // matters -- holding still is part of the plan -- but it cannot win a distance contest
+    // against the leg it sits between, so leave it to the neighbouring segments.
+    const double u = length2 > 1e-12 ? std::clamp((handPos - seg.from).dot(delta) / length2, 0.0, 1.0) : 0.0;
+    const double distance = (handPos - (seg.from + u * delta)).norm();
+    if(distance >= bestDistance)
+    {
+      continue;
+    }
+    bestDistance = distance;
+    // Invert the min-jerk profile: s(tau) is strictly increasing on [0,1], so bisection is
+    // both correct and cheap. Solved rather than approximated because the profile spends most
+    // of its time in the middle of the segment -- a linear guess would put the phase a long
+    // way out near either end, which is exactly where the corner of the L is.
+    double lo = 0.0;
+    double hi = 1.0;
+    for(int i = 0; i < 30; ++i)
+    {
+      const double mid = 0.5 * (lo + hi);
+      double sMid = 0.0;
+      double dsMid = 0.0;
+      minJerkUnit(mid, sMid, dsMid);
+      (sMid < u ? lo : hi) = mid;
+    }
+    bestTime = seg.start + 0.5 * (lo + hi) * seg.duration;
+  }
+
+  if(partner.labelClock < 0.0)
+  {
+    partner.labelClock = bestTime;
+    return bestTime;
+  }
+  // Monotone, and rate-limited to what the plan itself covers in a tick times a slack factor.
+  // The trajectory is an L: near the corner the transit and the descent pass close together in
+  // space, and an unguarded nearest-point search snaps between them. A person does not
+  // un-execute a plan, and does not skip half of one either.
+  const double ceiling = partner.labelClock + std::max(dt, 0.0) * partner.feedback.maxAdvanceRate;
+  partner.labelClock = std::clamp(bestTime, partner.labelClock, ceiling);
+  return partner.labelClock;
+}
+
 void SimHumanPartner::aimedPoint(const mc_rbdyn::Robot & robot, const Partner & partner,
                                  Eigen::Vector3d & position, Eigen::Vector3d & velocity)
 {
@@ -175,6 +231,32 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
           "[SimHumanPartner] partner '{}' has a negative gain; that is a partner that pushes away "
           "from its own target.",
           p.name);
+    }
+
+    if(entry.has("feedback"))
+    {
+      auto f = entry("feedback");
+      f("lookahead_time", p.feedback.lookaheadTime);
+      f("max_advance_rate", p.feedback.maxAdvanceRate);
+      if(p.feedback.lookaheadTime < 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a negative feedback lookahead_time. Use 0 to "
+            "read the plan from the clock, which is the behaviour without this block at all.",
+            p.name);
+      }
+    }
+    if(entry.has("label_stiffness"))
+    {
+      p.labelStiffness = entry("label_stiffness");
+      if((p.labelStiffness.array() < 0).any())
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a negative label_stiffness. It is the stiffness "
+            "this partner's *resistance* is measured with -- the gains it would have had if it "
+            "were acting -- not a second spring.",
+            p.name);
+      }
     }
 
     if(entry.has("search"))
@@ -587,22 +669,35 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
 
   for(auto & p : partners_)
   {
-    Eigen::Vector3d xRef = Eigen::Vector3d::Zero();
-    Eigen::Vector3d vRef = Eigen::Vector3d::Zero();
-    // Evaluating the intent in the past is the whole of the sensorimotor delay model: the
-    // partner acts on where it meant to be a reaction time ago, not on where it is now.
-    referenceAt(p, clock - p.delay, xRef, vRef);
-
     // The error is measured at the point the person is aiming, which is the point they push
     // through -- anchoring the spring anywhere else makes it blind to the motion it causes.
-    // See the Partner docs.
+    // See the Partner docs. Read before the reference because a state-fed partner's reference
+    // is a function of it; `aimedPoint` only reads the robot, so the order is free.
     Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
     Eigen::Vector3d handVel = Eigen::Vector3d::Zero();
     aimedPoint(robot, p, handPos, handVel);
 
+    Eigen::Vector3d xRef = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vRef = Eigen::Vector3d::Zero();
+    if(p.feedback.enabled())
+    {
+      // Where the plan says to go next *from where this hand actually is*. No delay term: a
+      // reaction time is a property of executing an answer, not of the answer, and a label
+      // that lags the state it is labelling is the defect this exists to remove.
+      referenceAt(p, phaseFromState(p, handPos, dt_) + p.feedback.lookaheadTime, xRef, vRef);
+    }
+    else
+    {
+      // Evaluating the intent in the past is the whole of the sensorimotor delay model: the
+      // partner acts on where it meant to be a reaction time ago, not on where it is now.
+      referenceAt(p, clock - p.delay, xRef, vRef);
+    }
+
     // What this person's hand feels, from the plan alone. Read before the dither is added so
     // that the search cannot hold itself on through its own displacement of the reference.
-    p.resistance = p.stiffness.cwiseProduct(xRef - handPos).norm();
+    // `feltStiffness` rather than `stiffness`: a zero-gain DAgger expert would otherwise feel
+    // nothing, never register contact, and silently label without the corrective search.
+    p.resistance = p.feltStiffness().cwiseProduct(xRef - handPos).norm();
 
     // Added to the intent, deliberately: `reference` is what is logged, extracted and cloned,
     // so a correction applied to the force instead would be invisible to a policy that
@@ -992,6 +1087,8 @@ void SimHumanPartner::startRecording(CollabPegInHoleController & collab, const m
     p.spiralProgress = 0.0;
     p.searchOffset.setZero();
     p.searchHoldUntil = -1.0;
+    // The plan is rebased onto this episode's hand, so last episode's phase means nothing.
+    p.labelClock = -1.0;
   }
   // Re-seeded on the first tick of the episode from the pose that tick measures.
   stuckSeeded_ = false;
@@ -1070,6 +1167,9 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
     // The trigger's own input, so "why did it wiggle there" is answerable from the log rather
     // than by reconstructing a spring from poses afterwards.
     logger.addLogEntry(prefix + "_resistance", [this, i]() { return partners_[i].resistance; });
+    // Where on its own plan a state-fed partner thinks it is. Held at -1 on the clock path, so
+    // a log says which kind of expert produced it rather than leaving that to the config file.
+    logger.addLogEntry(prefix + "_label_clock", [this, i]() { return partners_[i].labelClock; });
     logger.addLogEntry(prefix + "_search_offset",
                        [this, i]() -> const Eigen::Vector3d & { return partners_[i].searchOffset; });
   }

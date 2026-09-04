@@ -249,6 +249,66 @@ private:
     };
     Search search;
 
+    /** Reading the plan from the robot's state instead of from the clock.
+     *
+     * `referenceAt` is a function of `t` alone, which makes this partner a trajectory and not
+     * a policy. That is fine for a *demonstrator* -- it is executing a plan -- and fatal for
+     * a **DAgger expert**, which has to answer "what should be aimed at from the state the
+     * learner has actually reached". From a drifted state the clock-driven answer is "be
+     * where the plan says at time t", i.e. a jump proportional to how far the learner has
+     * strayed. Training on that pair teaches exactly the oversized command that empties the
+     * QP's constraint set, and it teaches it hardest in the states that drift most -- which
+     * is the pattern the 2026-09-04 DAgger iteration produced (-5.7 pp, p = 3.3e-05).
+     *
+     * With `lookaheadTime > 0` the phase comes from where the aimed point actually *is*:
+     * project it onto the plan's polyline, and read the reference that far ahead of the
+     * projection. The command is then bounded by (path speed x lookahead) however far the
+     * learner has drifted, and it points along the path rather than back at a stale clock --
+     * which is what makes it a recovery.
+     *
+     * 0 is the clock, exactly as before this existed. */
+    struct Feedback
+    {
+      /** Seconds ahead of the projected phase to aim. 0 disables the whole mechanism.
+       *
+       * This is the one parameter that sets how large a correction can be. Too small and the
+       * expert aims at its own feet and never advances; too large and it recovers the jump
+       * this exists to remove. */
+      double lookaheadTime = 0.0;
+      /** Seconds of plan the projected phase may advance per second of wall clock.
+       *
+       * The trajectory is an L, so the transit and the descent pass close to each other near
+       * the corner and a nearest-point search can jump between legs. The phase is kept
+       * monotone and rate-limited for that reason: a person does not un-execute a plan, and
+       * does not skip half of one either.
+       *
+       * 1.0 would pin the expert to the plan's own pace, which would make a learner that is
+       * *ahead* of the plan drag it backwards. The default is enough slack for a learner
+       * moving faster than the plan and far too little to cross a segment in a tick. */
+      double maxAdvanceRate = 3.0;
+      bool enabled() const { return lookaheadTime > 0.0; }
+    };
+    Feedback feedback;
+
+    /** The stiffness `resistance` is computed with, when it differs from `stiffness`.
+     *
+     * A DAgger expert is configured with **zero** gains so that it generates a reference and
+     * applies no force (`--keep-expert`). But `resistance` is `stiffness * (reference - hand)`,
+     * so a zero-gain partner feels identically nothing, `inContact` is never true, and its
+     * search can never fire -- so its labels silently omit the corrective search that every
+     * demonstration contains. That is not the `acting` gate, which is a phase flag and lets
+     * the ghost through; it is the zero stiffness.
+     *
+     * Set this to the gains the partner *would* have had and the ghost feels what its
+     * acting twin feels. Zero means "use `stiffness`", which is every ordinary partner. */
+    Eigen::Vector3d labelStiffness = Eigen::Vector3d::Zero();
+
+    /** The stiffness to measure resistance with: `labelStiffness` when set, else `stiffness`. */
+    Eigen::Vector3d feltStiffness() const
+    {
+      return labelStiffness.isZero() ? stiffness : labelStiffness;
+    }
+
     // Live search state, reset every episode by startRecording.
     double resistance = 0.0; // N this person is feeling against the plan, logged
     bool searching = false;  // is the stuck condition true right now
@@ -277,6 +337,12 @@ private:
      * Set when the search *starts*, and extended for as long as the stuck test keeps
      * confirming itself; what it bridges is the gap after the test stops confirming. */
     double searchHoldUntil = -1.0;
+    /** Episode time the state-fed phase has reached, kept monotone. -1 before the first tick.
+     *
+     * Monotone because the projection is a nearest-point search on a path that doubles back
+     * on itself in space; letting it fall would make the expert re-execute the transit
+     * whenever the descent brought the piece back past the corner. */
+    double labelClock = -1.0;
 
     // Live state, for logging and the GUI.
     Eigen::Vector3d reference = Eigen::Vector3d::Zero();
@@ -326,6 +392,18 @@ private:
 
   /** Minimum-jerk position and velocity of one partner's intent at time `t`. */
   static void referenceAt(const Partner & partner, double t, Eigen::Vector3d & position, Eigen::Vector3d & velocity);
+
+  /** Episode time of the point on `partner`'s plan nearest `handPos`, kept monotone.
+   *
+   * The plan is a polyline of straight segments with min-jerk timing, so the projection is
+   * exact: the nearest point of each segment is a clamped scalar projection onto its line,
+   * and the time that reaches it is the min-jerk inverse of that fraction. Returned as a time
+   * so that the answer can go straight back through `referenceAt` -- the state-fed expert and
+   * the clock-driven one are then the same function of a phase, differing only in where the
+   * phase comes from.
+   *
+   * `partner.labelClock` carries the monotone floor and is advanced by this call. */
+  static double phaseFromState(Partner & partner, const Eigen::Vector3d & handPos, double dt);
 
   /** Where a partner's aimed point is now, and how fast it is moving. World frame. */
   static void aimedPoint(const mc_rbdyn::Robot & robot, const Partner & partner, Eigen::Vector3d & position,
