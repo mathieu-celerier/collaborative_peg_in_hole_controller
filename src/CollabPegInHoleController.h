@@ -261,13 +261,17 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * impedance, the saturation -- is unchanged, so the two action spaces differ in exactly one
    * line and stay comparable.
    *
-   * One interaction to read the logs with: the reference now inherits the hand's own motion
-   * between policy steps, so `max_intent_speed` is measured against (hand speed + change in
-   * prediction) rather than the prediction alone, and `collab_policy_intent_limited` will
-   * fire more often here than in the absolute arm at the same ceiling. */
+   * `max_intent_speed` is applied to the prediction, above the reconstruction, so that it
+   * bounds what the policy asked for rather than the arm's own motion -- see
+   * updateIntentReference() for what limiting the rebuilt point did instead. */
   bool policyRelativeIntent_ = false;
   Eigen::Vector3d policyIntent_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d lastIntent_ = Eigen::Vector3d::Zero();
+  /** The previous prediction, in the policy's own action space -- what `max_intent_speed` is
+   * measured against. Equal to `lastIntent_` for an absolute policy; a displacement for a
+   * relative one, so the limiter bounds the prediction rather than the arm's own motion. */
+  Eigen::Vector3d lastCommand_ = Eigen::Vector3d::Zero();
+  bool haveLastCommand_ = false;
   Eigen::Vector3d policyRefVelocity_ = Eigen::Vector3d::Zero();
   bool haveLastIntent_ = false;
   /** Whether the impedance hit `max_force` this tick. Logged: a policy that saturates

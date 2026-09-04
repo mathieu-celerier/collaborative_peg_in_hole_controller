@@ -1121,19 +1121,46 @@ void CollabPegInHoleController::aimedPoint(const mc_rbdyn::Robot & robot,
 void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & predicted)
 {
   const double interval = timeStep * policyDecimation_;
-  // Where the intent is allowed to be, which is the prediction unless it asks to move faster
-  // than a hand does. The direction is kept and only the distance is spent, so a limited step
-  // is still heading where the policy asked -- it just takes more policy steps to arrive.
+  // The rate limit is applied in the policy's OWN action space, before a relative prediction
+  // is turned back into a world point. That is not a detail: the limit exists to stop a chunk
+  // landing far from the last one, which is a statement about the *prediction*, and in the
+  // relative space the reference is also supposed to follow the hand. Limiting the rebuilt
+  // point makes those two fight -- at 0.25 m/s and a 10 ms step the budget is 2.5 mm while the
+  // hand alone moves up to 1.8 mm, so the limiter spends its allowance on the arm's own motion,
+  // the reference falls behind the hand it should be tracking, and `intent - hand` *grows*.
+  // Measured before the fix: median 31 mm but a 630 mm maximum, limiter firing on 60 % of
+  // ticks. For an absolute policy the two spaces are the same and nothing here changes.
   //
   // This is the policy channel's version of conditionExternalTorques(): the same argument,
   // that a magnitude the arm cannot answer empties the QP's constraint set, applied to the
   // one input that reaches the solver without passing through it. Off by default.
-  // A relative policy predicts where its hand should go *from where its hand is*, so the
-  // reference is rebuilt here and everything below this line is unchanged. Reconstructing at
-  // this point rather than at the socket is deliberate: the rate limit, the impedance and the
-  // saturation then all see the same absolute reference they always did, and the two action
-  // spaces differ by exactly this addition.
-  Eigen::Vector3d intent = predicted;
+  Eigen::Vector3d command = predicted;
+  policyIntentLimited_ = false;
+  // `haveLastCommand_` gates it: the first prediction of an episode has nothing to be a step
+  // from, and limiting it against a stale anchor would drag the partner back towards where
+  // the previous episode ended. That first point can still stretch the spring arbitrarily far
+  // -- which is what `max_force` is for. The two bounds cover different halves of the
+  // problem, and neither substitutes for the other.
+  if(policyMaxIntentSpeed_ > 0.0 && haveLastCommand_)
+  {
+    const Eigen::Vector3d step = command - lastCommand_;
+    const double reach = policyMaxIntentSpeed_ * interval;
+    const double asked = step.norm();
+    if(asked > reach)
+    {
+      // The direction is kept and only the distance is spent, so a limited step is still
+      // heading where the policy asked -- it just takes more policy steps to arrive.
+      command = lastCommand_ + step * (reach / asked);
+      policyIntentLimited_ = true;
+    }
+  }
+  lastCommand_ = command;
+  haveLastCommand_ = true;
+
+  // A relative policy predicts where its hand should go *from where its hand is*. Everything
+  // below this line -- the reference velocity, the impedance, the saturation, the refAccel_
+  // injection -- then sees the same absolute reference it always did.
+  Eigen::Vector3d intent = command;
   if(policyRelativeIntent_)
   {
     Eigen::Vector3d handPos = Eigen::Vector3d::Zero();
@@ -1141,25 +1168,11 @@ void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & pr
     aimedPoint(robot(), policyRefBody_, policyRefPoint_, handPos, handVel);
     intent += handPos;
   }
-  policyIntentLimited_ = false;
-  // `haveLastIntent_` gates it: the first prediction of an episode has nothing to be a step
-  // from, and limiting it against a stale anchor would drag the partner back towards where
-  // the previous episode ended. That first point can still stretch the spring arbitrarily far
-  // -- which is what `max_force` is for. The two bounds cover different halves of the
-  // problem, and neither substitutes for the other.
-  if(policyMaxIntentSpeed_ > 0.0 && haveLastIntent_)
-  {
-    const Eigen::Vector3d step = intent - lastIntent_;
-    const double reach = policyMaxIntentSpeed_ * interval;
-    const double asked = step.norm();
-    if(asked > reach)
-    {
-      intent = lastIntent_ + step * (reach / asked);
-      policyIntentLimited_ = true;
-    }
-  }
   // The derivative of a prediction, so it carries the prediction's error: filtered, and the
-  // first step taken as zero rather than as a step from an arbitrary initial value.
+  // first step taken as zero rather than as a step from an arbitrary initial value. Taken in
+  // world frame in both action spaces, because it is fed to the impedance against the hand's
+  // world velocity -- for a relative policy that correctly makes it (hand velocity + rate of
+  // change of the displacement), which is what the demonstrator's own vRef is.
   const Eigen::Vector3d raw = haveLastIntent_ ? Eigen::Vector3d((intent - lastIntent_) / interval)
                                               : Eigen::Vector3d(Eigen::Vector3d::Zero());
   policyRefVelocity_ = policyVelocityFilter_ * raw + (1.0 - policyVelocityFilter_) * policyRefVelocity_;
@@ -1204,6 +1217,7 @@ void CollabPegInHoleController::updatePolicyPartner()
     // with a stale reference velocity injects a `kd vRef` term from before the pause.
     policyRefVelocity_.setZero();
     haveLastIntent_ = false;
+    haveLastCommand_ = false;
     policySaturated_ = false;
     policyIntentLimited_ = false;
     // The anchor is per-episode: it is taken again, from wherever the next episode's hand
@@ -1652,10 +1666,20 @@ void CollabPegInHoleController::addLog()
                        [this]() -> const Eigen::Vector3d & { return policyRefVelocity_; });
   // Distance from the predicted intent to the point the impedance pulls: the policy's own
   // tracking error, and the thing to read when the dyad moves but does not insert.
+  //
+  // NaN, not 0, while no prediction has been installed this episode. `policyIntent_` is not
+  // cleared between episodes -- and starts at the origin -- so before the first prediction
+  // this reads the hand's distance from the world origin, a constant 630 mm that is not a
+  // command and that nothing distinguishes from one. It arrived in 15 % of the ticks of a run
+  // and went straight into a summary statistic. 0 would be no better: zero stretch is a value
+  // the policy can legitimately ask for.
   logger().addLogEntry("collab_policy_intent_error", this,
                        [this]() -> double
                        {
-                         if(policyOutputKind_ != "intent" || policyRefBody_.empty()) { return 0.0; }
+                         if(policyOutputKind_ != "intent" || policyRefBody_.empty() || !haveLastIntent_)
+                         {
+                           return std::numeric_limits<double>::quiet_NaN();
+                         }
                          Eigen::Vector3d position = Eigen::Vector3d::Zero();
                          Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
                          aimedPoint(robot(), policyRefBody_, policyRefPoint_, position, velocity);
