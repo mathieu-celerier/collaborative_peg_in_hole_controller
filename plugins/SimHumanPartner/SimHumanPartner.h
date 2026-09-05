@@ -592,6 +592,13 @@ private:
    * k+1 gets exactly the noise it would have had in an uninterrupted run, and tells the
    * controller to number from k+1.
    *
+   * `k` is the count of *completed* episodes, so the episode the failure happened in is
+   * re-run rather than skipped, with the draw it already had. That is deliberate: episode k
+   * of a cell has to be the same seeded episode in every arm, and skipping one would shift
+   * every later draw against the arm being compared. Verified end to end -- a cell that died
+   * in episode 2 of 3 was relaunched and its episode 2 came back with the same gain scale,
+   * 1.0119089535461756, that the truncated one carried.
+   *
    * Consuming draws rather than re-seeding is deliberate: seed-matching is what makes every
    * comparison in this project paired, and a resumed cell has to stay matched to the same cell
    * in the arm it is being compared against.
