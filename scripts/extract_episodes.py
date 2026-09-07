@@ -78,6 +78,11 @@ OBSERVATIONS = {
     # reconstructed at the tool frame: both people, then person A alone
     "ext_wrench": "collab_ext_wrench",
     "residual_wrench": "collab_residual_wrench",
+    # the controller's own causal estimate of the partner it is working with -- six values,
+    # the same ones cpih.policy.context.partner_context computes at export time. Carried so
+    # that check_context_agreement.py can compare the two: they are supposed to be identical,
+    # and nothing else would notice if they stopped being.
+    "partner_context": "collab_partner_context",
     # task space
     "tool_pose": "collab_tool_pose",
     "insertion_pose": "collab_insertion_pose",

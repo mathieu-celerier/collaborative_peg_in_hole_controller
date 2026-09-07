@@ -191,6 +191,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("max_intent_speed", policyMaxIntentSpeed_);
     pconfig("relative_intent", policyRelativeIntent_);
     pconfig("log_observation", logPolicyObservation_);
+    pconfig("partner_context", policyPartnerContext_);
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
     pconfig("remote_port", policyRemotePort_);
@@ -504,6 +505,13 @@ bool CollabPegInHoleController::run()
   // to hit: joints 5-7 are limited to 9 N.m against 39 N.m for joints 1-4, so ~30 N on the plate
   // at ~0.3 m already outruns joint_5.
   conditionExternalTorques();
+
+  // Strictly before updatePolicyPartner(), which is what reads the observation: the context
+  // the policy is given must be computed from THIS tick's wrench and pose, not the previous
+  // one's. It runs unconditionally so that the logged channel exists for every episode --
+  // including the demonstrations, whose logs are what the exporter's version is checked
+  // against -- and costs a 2x2 solve.
+  updatePartnerContext();
 
   // Ahead of the FSM, so the trigger term this writes is from this tick and not the last
   // one: updateDualCompliance() runs inside the Compliant state, below.
@@ -1072,6 +1080,123 @@ Eigen::VectorXd CollabPegInHoleController::policyFeatures() const
   return x;
 }
 
+namespace
+{
+// cpih.policy.context's constants, verbatim. Changing one here without changing it there is a
+// silent train/serve skew; check_context_agreement.py is what catches it.
+constexpr double kCtxTau = 1.0;      // EMA time constant of the running means [s]
+constexpr double kCtxTauFit = 5.0;   // and of the regression accumulators [s]
+constexpr double kCtxRidge = 1e-6;   // holds the fit near zero until the partner has moved the tool
+constexpr double kCtxKClip = 2.0;    // kN/m
+constexpr double kCtxCClip = 2.0;    // kNs/m
+constexpr double kCtxAgeMax = 20.0;  // s
+// The rate the episodes are extracted at, and therefore the rate this recursion runs at.
+// extract_episodes.py --rate 100 is what every dataset in use was written with.
+constexpr double kCtxRate = 0.01;    // s per estimator step
+} // namespace
+
+void CollabPegInHoleController::resetPartnerContext()
+{
+  partnerContext_.setZero();
+  ctxPosBar_.setZero();
+  ctxForceBar_.setZero();
+  ctxPrevPos_.setZero();
+  ctxFMagBar_ = ctxFDevBar_ = ctxVMagBar_ = 0.0;
+  ctxSxx_ = ctxSxv_ = ctxSvv_ = ctxSxf_ = ctxSvf_ = 0.0;
+  ctxSeeded_ = false;
+  ctxAge_ = 0.0;
+  ctxForceAccum_.setZero();
+  ctxAccumTicks_ = 0;
+}
+
+void CollabPegInHoleController::updatePartnerContext()
+{
+  const auto & r = robot();
+  const Eigen::Vector3d pos = r.frame(tool_frame).position().translation();
+  Eigen::Vector3d force = Eigen::Vector3d::Zero();  // reassigned below with the decimated mean
+  if(r.hasForceSensor(ft_sensor))
+  {
+    // The same quantity the dataset's collab_ft_wrench_world carries, and the same one
+    // policyObservation() puts in its wrench block -- gravity-free, world frame.
+    force = r.forceSensor(ft_sensor).worldWrenchWithoutGravity(r).force();
+  }
+
+  // Step on the ticks the extractor SAMPLES, which are 0, divider, 2*divider... -- it strides
+  // the tool pose with no filter, so stepping at the end of each window instead would read the
+  // position nine ticks late and put the whole sequence out of phase with the training data.
+  // Measured with the step at the end of the window: k differed by 0.19 kN/m early in the
+  // episode, where it moves fastest.
+  //
+  // The force is the mean over the ticks up to and including this one, because the extractor
+  // smooths that channel before striding it. Its average is centred and this one cannot be --
+  // a controller has no future samples -- so a half-window of lag survives here by
+  // construction. That is the residual the agreement check tolerates.
+  const int divider = std::max(1, static_cast<int>(std::lround(kCtxRate / timeStep)));
+  ctxForceAccum_ += force;
+  ++ctxAccumTicks_;
+  if(ctxAccumTicks_ < divider && ctxSeeded_)
+  {
+    return;
+  }
+  force = ctxForceAccum_ / static_cast<double>(ctxAccumTicks_);
+  ctxForceAccum_.setZero();
+  ctxAccumTicks_ = 0;
+
+  const double dt = kCtxRate;
+  const double a = std::exp(-dt / kCtxTau);
+  const double aFit = std::exp(-dt / kCtxTauFit);
+
+  if(!ctxSeeded_)
+  {
+    // Mirrors the exporter's first row: the means start AT the first sample rather than at
+    // zero, so the estimate does not spend a second climbing out of the origin.
+    ctxPosBar_ = pos;
+    ctxForceBar_ = force;
+    ctxPrevPos_ = pos;
+    ctxSeeded_ = true;
+  }
+
+  const Eigen::Vector3d vel = (pos - ctxPrevPos_) / dt;
+  ctxPrevPos_ = pos;
+
+  ctxPosBar_ = a * ctxPosBar_ + (1.0 - a) * pos;
+  ctxForceBar_ = a * ctxForceBar_ + (1.0 - a) * force;
+  const Eigen::Vector3d dx = pos - ctxPosBar_;
+  const Eigen::Vector3d df = force - ctxForceBar_;
+
+  const double fMag = force.norm();
+  const double vMag = vel.norm();
+  ctxFMagBar_ = a * ctxFMagBar_ + (1.0 - a) * fMag;
+  ctxFDevBar_ = a * ctxFDevBar_ + (1.0 - a) * std::pow(fMag - ctxFMagBar_, 2);
+  ctxVMagBar_ = a * ctxVMagBar_ + (1.0 - a) * vMag;
+
+  // One isotropic (k, c) shared by the three axes: the partner model IS an isotropic
+  // spring-damper, so fitting per-axis would divide the same excitation three ways.
+  ctxSxx_ = aFit * ctxSxx_ + dx.dot(dx);
+  ctxSxv_ = aFit * ctxSxv_ + dx.dot(vel);
+  ctxSvv_ = aFit * ctxSvv_ + vel.dot(vel);
+  ctxSxf_ = aFit * ctxSxf_ + dx.dot(df);
+  ctxSvf_ = aFit * ctxSvf_ + vel.dot(df);
+
+  Eigen::Matrix2d g;
+  g << ctxSxx_ + kCtxRidge, ctxSxv_, ctxSxv_, ctxSvv_ + kCtxRidge;
+  double k = 0.0, c = 0.0;
+  if(g.determinant() > 1e-18)
+  {
+    const Eigen::Vector2d sol = g.colPivHouseholderQr().solve(Eigen::Vector2d(ctxSxf_, ctxSvf_));
+    k = sol(0);
+    c = sol(1);
+  }
+
+  partnerContext_(0) = ctxFMagBar_;
+  partnerContext_(1) = std::sqrt(std::max(ctxFDevBar_, 0.0));
+  partnerContext_(2) = ctxVMagBar_;
+  partnerContext_(3) = std::clamp(k / 1000.0, -kCtxKClip, kCtxKClip);
+  partnerContext_(4) = std::clamp(c / 1000.0, -kCtxCClip, kCtxCClip);
+  partnerContext_(5) = std::min(ctxAge_, kCtxAgeMax);
+  ctxAge_ += dt;  // so the first step reports 0, exactly as the exporter's first row does
+}
+
 Eigen::VectorXd CollabPegInHoleController::policyObservation() const
 {
   const auto & r = robot();
@@ -1090,7 +1215,9 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
 
   // 7 + 7 + 9 + 6 = 29, and the order is RMB's --state_keys order:
   // measured_joint_pos, measured_joint_vel, measured_eef_pose, measured_eef_wrench.
-  Eigen::VectorXd x = Eigen::VectorXd::Zero(29);
+  // With partner context on it is 35, and the extra block goes LAST because --state_keys
+  // concatenates in the order given and measured_partner_context is named last there.
+  Eigen::VectorXd x = Eigen::VectorXd::Zero(policyPartnerContext_ ? 35 : 29);
   for(std::size_t i = 0; i < 7 && i < q.size(); ++i) { x(static_cast<Eigen::Index>(i)) = q[i]; }
   for(std::size_t i = 0; i < 7 && i < dq.size(); ++i) { x(7 + static_cast<Eigen::Index>(i)) = dq[i]; }
   x.segment<3>(14) = X_0_tool.translation();
@@ -1100,6 +1227,10 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
   // Force first, then couple -- the opposite of how ForceVecd stores them.
   x.segment<3>(23) = wrench.force();
   x.segment<3>(26) = wrench.couple();
+  if(policyPartnerContext_)
+  {
+    x.segment<6>(29) = partnerContext_;
+  }
   return x;
 }
 
@@ -1421,6 +1552,11 @@ void CollabPegInHoleController::startEpisode()
   {
     remote_->reset();
   }
+  // The estimator is per-episode for the same reason the intent anchor is: the exporter
+  // starts each episode's context sequence from that episode's first sample, so carrying
+  // state across an episode boundary would put the controller and the training data in
+  // different states from tick 0.
+  resetPartnerContext();
   // run() increments before the logger samples the tick, so -1 here makes the first recorded
   // sample of the episode carry tick 0.
   episodeTick_ = -1;
@@ -1743,6 +1879,13 @@ void CollabPegInHoleController::addLog()
     logger().addLogEntry("collab_policy_observation", this,
                          [this]() -> Eigen::VectorXd { return policyObservation(); });
   }
+  // Unconditional, unlike collab_policy_observation above: six doubles is cheap, the estimator
+  // runs in every episode anyway, and this channel is how the C++ and Python implementations
+  // are held to being the same function. A demonstration is the comparison that matters --
+  // it is what the exporter reads -- so gating this on a policy flag would put the check out
+  // of reach exactly where it is needed. See scripts/check_context_agreement.py.
+  logger().addLogEntry("collab_partner_context", this,
+                       [this]() -> Eigen::VectorXd { return partnerContext_; });
   logger().addLogEntry("collab_ext_wrench", this, [this]() -> sva::ForceVecd { return externalWrench_; });
   logger().addLogEntry("collab_ext_wrench_norm", this, [this]() -> double { return externalWrench_.vector().norm(); });
   // The A-only counterpart of collab_ext_wrench, in the same frame and the same units, so the

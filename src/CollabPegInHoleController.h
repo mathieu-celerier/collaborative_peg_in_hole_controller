@@ -148,6 +148,27 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    */
   Eigen::VectorXd policyObservation() const;
 
+  /** Six numbers describing the partner the policy is currently working with.
+   *
+   * MUST stay numerically identical to `cpih.policy.context.partner_context` in the learning
+   * repo, which computes the same thing at export time; the constants below are that module's,
+   * and `scripts/check_context_agreement.py` compares the two on a logged episode. A mismatch
+   * here is a silent train/serve skew in the input the policy leans on hardest, and nothing
+   * would raise -- the widths would still agree.
+   *
+   * Why it exists: the six leader x effort regimes differ only in the partners' GAINS, and the
+   * 29-value observation names neither leader nor effort. Measured on train9, the leader is
+   * recoverable from a 1 s window of wrench and tool motion at 40 %, from 10 s at 83 %, and
+   * from this vector at a single instant at up to 90 % -- but `n_obs_steps: 2` is 20 ms of
+   * history, so without this the policy cannot tell the regimes apart and learns an average
+   * of all six.
+   *
+   * Layout: f_mean [N] | f_dev [N] | v_mean [m/s] | k [kN/m] | c [kNs/m] | age [s, capped].
+   */
+  Eigen::Matrix<double, 6, 1> partnerContext() const { return partnerContext_; }
+  void updatePartnerContext();
+  void resetPartnerContext();
+
   /** Position and velocity of a point rigidly attached to a body, world frame.
    *
    * Mirrors `SimHumanPartner::aimedPoint`. The angular cross term is not optional: the hole
@@ -240,6 +261,38 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   /** The point the impedance closes on -- where the replaced partner aimed, which is the
    * point it pushed through. A spring anchored anywhere else is blind to the motion it
    * causes; see SimHumanPartner's Partner docs. */
+  /** Whether `measured_partner_context` is appended to the observation, making it 35 wide.
+   *
+   * Off by default, because every checkpoint trained before this expects exactly 29 and the
+   * remote server rejects a mismatched width with rows=0 -- which the controller treats as a
+   * dead policy. Turn it on only for a checkpoint trained with the key in --state_keys. */
+  bool policyPartnerContext_ = false;
+  Eigen::Matrix<double, 6, 1> partnerContext_ = Eigen::Matrix<double, 6, 1>::Zero();
+  /** Estimator state. Reset at every episode start, exactly as the exporter starts each
+   * episode's sequence from its own first sample. */
+  Eigen::Vector3d ctxPosBar_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ctxForceBar_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ctxPrevPos_ = Eigen::Vector3d::Zero();
+  double ctxFMagBar_ = 0.0;
+  double ctxFDevBar_ = 0.0;
+  double ctxVMagBar_ = 0.0;
+  double ctxSxx_ = 0.0, ctxSxv_ = 0.0, ctxSvv_ = 0.0, ctxSxf_ = 0.0, ctxSvf_ = 0.0;
+  bool ctxSeeded_ = false;
+  double ctxAge_ = 0.0;
+  /** The estimator advances at the DATASET's rate (100 Hz), not the controller's (1 kHz).
+   *
+   * It is a discrete recursion, so its output depends on the step it is iterated at: run at
+   * 1 kHz against a 100 Hz training set it produces a different sequence from the same
+   * physics, which is a train/serve skew that no width check would catch. Measured before
+   * this: f_dev differed by 0.17 N and k by 0.08 kN/m on the same episode.
+   *
+   * The force is accumulated and averaged over the ticks in between, because that is what the
+   * extractor does to it (`decimate(..., smooth=True)` is a moving average, then a stride).
+   * The extractor's average is CENTRED and this one cannot be -- a controller has no future
+   * samples -- so the two differ by that half-window of lag, and nothing can remove it. That
+   * is the residual the agreement check tolerates; it is a 5 ms phase shift on a 1 Hz signal. */
+  Eigen::Vector3d ctxForceAccum_ = Eigen::Vector3d::Zero();
+  int ctxAccumTicks_ = 0;
   std::string policyRefBody_;
   Eigen::Vector3d policyRefPoint_ = Eigen::Vector3d::Zero();
   /** First-order filter on the differentiated intent, as a per-policy-step blend factor.
