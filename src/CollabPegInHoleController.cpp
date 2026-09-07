@@ -1093,6 +1093,12 @@ constexpr double kCtxAgeMax = 20.0;  // s
 // The rate the episodes are extracted at, and therefore the rate this recursion runs at.
 // extract_episodes.py --rate 100 is what every dataset in use was written with.
 constexpr double kCtxRate = 0.01;    // s per estimator step
+// The extractor's decimation, which this has to reproduce rather than approximate:
+//   moving_average(window=10 -> rounded up to 11, zero-phase, reflected edges) then [::10]
+// for force, and a plain [::10] stride for the tool pose. So dataset sample i is the mean of
+// raw ticks [10i-5, 10i+5] and the position at tick 10i exactly.
+constexpr int kCtxStride = 10;       // raw ticks per dataset sample
+constexpr int kCtxHalf = 5;          // half the box width
 } // namespace
 
 void CollabPegInHoleController::resetPartnerContext()
@@ -1105,14 +1111,15 @@ void CollabPegInHoleController::resetPartnerContext()
   ctxSxx_ = ctxSxv_ = ctxSvv_ = ctxSxf_ = ctxSvf_ = 0.0;
   ctxSeeded_ = false;
   ctxAge_ = 0.0;
-  ctxForceAccum_.setZero();
-  ctxAccumTicks_ = 0;
+  ctxTick_ = 0;
+  ctxForceRing_.fill(Eigen::Vector3d::Zero());
+  ctxPosRing_.fill(Eigen::Vector3d::Zero());
 }
 
 void CollabPegInHoleController::updatePartnerContext()
 {
   const auto & r = robot();
-  const Eigen::Vector3d pos = r.frame(tool_frame).position().translation();
+  Eigen::Vector3d pos = r.frame(tool_frame).position().translation();  // replaced by the strided sample
   Eigen::Vector3d force = Eigen::Vector3d::Zero();  // reassigned below with the decimated mean
   if(r.hasForceSensor(ft_sensor))
   {
@@ -1121,26 +1128,52 @@ void CollabPegInHoleController::updatePartnerContext()
     force = r.forceSensor(ft_sensor).worldWrenchWithoutGravity(r).force();
   }
 
-  // Step on the ticks the extractor SAMPLES, which are 0, divider, 2*divider... -- it strides
-  // the tool pose with no filter, so stepping at the end of each window instead would read the
-  // position nine ticks late and put the whole sequence out of phase with the training data.
-  // Measured with the step at the end of the window: k differed by 0.19 kN/m early in the
-  // episode, where it moves fastest.
+  // Run FIVE MILLISECONDS BEHIND, which is what makes this exact rather than close.
   //
-  // The force is the mean over the ticks up to and including this one, because the extractor
-  // smooths that channel before striding it. Its average is centred and this one cannot be --
-  // a controller has no future samples -- so a half-window of lag survives here by
-  // construction. That is the residual the agreement check tolerates.
-  const int divider = std::max(1, static_cast<int>(std::lround(kCtxRate / timeStep)));
-  ctxForceAccum_ += force;
-  ++ctxAccumTicks_;
-  if(ctxAccumTicks_ < divider && ctxSeeded_)
+  // The extractor's box filter is zero-phase -- dataset sample i is the mean of raw ticks
+  // [10i-5, 10i+5] -- and a controller has no future samples, so computing the same statistic
+  // from a trailing window put the two half a window out of phase. That is not a small effect
+  // where it matters: on policy-driven episodes it drove k and c apart by 0.9 and 0.47 against
+  // a 0.05 tolerance, worst in the leading regimes and in the first two seconds, because the
+  // error scales with how hard the tool is being driven.
+  //
+  // Waiting until tick 10i+5 gives the window every sample it needs. The context is then 5 ms
+  // stale, which is nothing against a 1 s EMA and a 5 s fit -- and it is the same function the
+  // training data was built with, rather than a different one that happens to be causal.
+  const int tick = ctxTick_++;
+  ctxForceRing_[tick % ctxForceRing_.size()] = force;
+  ctxPosRing_[tick % ctxPosRing_.size()] = pos;
+  if(tick < kCtxHalf || (tick - kCtxHalf) % kCtxStride != 0)
   {
     return;
   }
-  force = ctxForceAccum_ / static_cast<double>(ctxAccumTicks_);
-  ctxForceAccum_.setZero();
-  ctxAccumTicks_ = 0;
+  const int sample = (tick - kCtxHalf) / kCtxStride;
+
+  // The strided position: tick 10*sample, which is kCtxHalf ticks ago.
+  const Eigen::Vector3d sampledPos = ctxPosRing_[(tick - kCtxHalf) % ctxPosRing_.size()];
+  Eigen::Vector3d sampledForce = Eigen::Vector3d::Zero();
+  if(sample == 0)
+  {
+    // np.pad(..., mode="reflect") at the start: indices -1..-5 mirror to 1..5, so the first
+    // window is x0 plus twice x1..x5, over 11. Reproduced rather than skipped because this
+    // sample is what seeds both EMAs.
+    sampledForce = ctxForceRing_[0];
+    for(int j = 1; j <= kCtxHalf; ++j)
+    {
+      sampledForce += 2.0 * ctxForceRing_[j];
+    }
+    sampledForce /= static_cast<double>(ctxForceRing_.size());
+  }
+  else
+  {
+    for(const auto & f : ctxForceRing_)
+    {
+      sampledForce += f;
+    }
+    sampledForce /= static_cast<double>(ctxForceRing_.size());
+  }
+  force = sampledForce;
+  pos = sampledPos;
 
   const double dt = kCtxRate;
   const double a = std::exp(-dt / kCtxTau);

@@ -12,6 +12,7 @@
 #include "RemotePolicy.h"
 #include "api.h"
 
+#include <array>
 #include <deque>
 #include <map>
 #include <memory>
@@ -291,8 +292,13 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * The extractor's average is CENTRED and this one cannot be -- a controller has no future
    * samples -- so the two differ by that half-window of lag, and nothing can remove it. That
    * is the residual the agreement check tolerates; it is a 5 ms phase shift on a 1 Hz signal. */
-  Eigen::Vector3d ctxForceAccum_ = Eigen::Vector3d::Zero();
-  int ctxAccumTicks_ = 0;
+  /** Raw ticks since the episode began. The estimator steps on a schedule derived from it. */
+  int ctxTick_ = 0;
+  /** The last 11 forces and 6 positions, so that a step can reproduce the extractor's window
+   * exactly. 11 is the extractor's box width (it rounds 10 up to odd); 6 is how far back the
+   * strided position sample sits when the window closes. */
+  std::array<Eigen::Vector3d, 11> ctxForceRing_;
+  std::array<Eigen::Vector3d, 6> ctxPosRing_;
   std::string policyRefBody_;
   Eigen::Vector3d policyRefPoint_ = Eigen::Vector3d::Zero();
   /** First-order filter on the differentiated intent, as a per-policy-step blend factor.
