@@ -193,6 +193,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("relative_intent", policyRelativeIntent_);
     pconfig("log_observation", logPolicyObservation_);
     pconfig("partner_context", policyPartnerContext_);
+    pconfig("own_force_context", policyOwnForceContext_);
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
     pconfig("remote_port", policyRemotePort_);
@@ -517,6 +518,11 @@ bool CollabPegInHoleController::run()
   // Ahead of the FSM, so the trigger term this writes is from this tick and not the last
   // one: updateDualCompliance() runs inside the Compliant state, below.
   updatePolicyPartner();
+
+  // After the policy, so the force it just applied -- the value the logger records for this
+  // tick -- is what enters slot t of the ring. Unconditional, like the partner context, so the
+  // channel is logged in every episode and can be checked against the exporter's.
+  updateOwnForceContext();
 
   if(recording_)
   {
@@ -1115,6 +1121,55 @@ void CollabPegInHoleController::resetPartnerContext()
   ctxTick_ = 0;
   ctxForceRing_.fill(Eigen::Vector3d::Zero());
   ctxPosRing_.fill(Eigen::Vector3d::Zero());
+  ownForceContext_.setZero();
+  ownForceBar_.setZero();
+  ownFMagBar_ = 0.0;
+  ownSeeded_ = false;
+  ownTick_ = 0;
+  ownForceRing_.fill(Eigen::Vector3d::Zero());
+}
+
+void CollabPegInHoleController::updateOwnForceContext()
+{
+  // The same window and schedule as updatePartnerContext()'s force: sample i is the mean of
+  // ticks [10i-5, 10i+5] (reflected at the episode start), available at tick 10i+5. A policy
+  // query at tick 10k therefore sees samples 0..k-1 -- the one-sample lag the exporter applies.
+  const int tick = ownTick_++;
+  ownForceRing_[tick % ownForceRing_.size()] = policyForce_;
+  if(tick < kCtxHalf || (tick - kCtxHalf) % kCtxStride != 0)
+  {
+    return;
+  }
+  const int sample = (tick - kCtxHalf) / kCtxStride;
+  Eigen::Vector3d force = Eigen::Vector3d::Zero();
+  if(sample == 0)
+  {
+    force = ownForceRing_[0];
+    for(int j = 1; j <= kCtxHalf; ++j)
+    {
+      force += 2.0 * ownForceRing_[j];
+    }
+  }
+  else
+  {
+    for(const auto & f : ownForceRing_)
+    {
+      force += f;
+    }
+  }
+  force /= static_cast<double>(ownForceRing_.size());
+
+  const double a = std::exp(-kCtxRate / kCtxTau);
+  if(!ownSeeded_)
+  {
+    ownForceBar_ = force;
+    ownFMagBar_ = force.norm();
+    ownSeeded_ = true;
+  }
+  ownForceBar_ = a * ownForceBar_ + (1.0 - a) * force;
+  ownFMagBar_ = a * ownFMagBar_ + (1.0 - a) * force.norm();
+  ownForceContext_.head<3>() = ownForceBar_;
+  ownForceContext_(3) = ownFMagBar_;
 }
 
 void CollabPegInHoleController::updatePartnerContext()
@@ -1251,7 +1306,10 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
   // measured_joint_pos, measured_joint_vel, measured_eef_pose, measured_eef_wrench.
   // With partner context on it is 35, and the extra block goes LAST because --state_keys
   // concatenates in the order given and measured_partner_context is named last there.
-  Eigen::VectorXd x = Eigen::VectorXd::Zero(policyPartnerContext_ ? 35 : 29);
+  // The own-force block, when on, comes after it: measured_own_force_context is named after
+  // measured_partner_context in --state_keys.
+  const Eigen::Index width = 29 + (policyPartnerContext_ ? 6 : 0) + (policyOwnForceContext_ ? 4 : 0);
+  Eigen::VectorXd x = Eigen::VectorXd::Zero(width);
   for(std::size_t i = 0; i < 7 && i < q.size(); ++i) { x(static_cast<Eigen::Index>(i)) = q[i]; }
   for(std::size_t i = 0; i < 7 && i < dq.size(); ++i) { x(7 + static_cast<Eigen::Index>(i)) = dq[i]; }
   x.segment<3>(14) = X_0_tool.translation();
@@ -1264,6 +1322,10 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
   if(policyPartnerContext_)
   {
     x.segment<6>(29) = partnerContext_;
+  }
+  if(policyOwnForceContext_)
+  {
+    x.tail<4>() = ownForceContext_;
   }
   return x;
 }
@@ -1947,6 +2009,8 @@ void CollabPegInHoleController::addLog()
   // of reach exactly where it is needed. See scripts/check_context_agreement.py.
   logger().addLogEntry("collab_partner_context", this,
                        [this]() -> Eigen::VectorXd { return partnerContext_; });
+  logger().addLogEntry("collab_own_force_context", this,
+                       [this]() -> Eigen::VectorXd { return ownForceContext_; });
   logger().addLogEntry("collab_ext_wrench", this, [this]() -> sva::ForceVecd { return externalWrench_; });
   logger().addLogEntry("collab_ext_wrench_norm", this, [this]() -> double { return externalWrench_.vector().norm(); });
   // The A-only counterpart of collab_ext_wrench, in the same frame and the same units, so the

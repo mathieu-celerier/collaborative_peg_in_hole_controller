@@ -169,6 +169,13 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   Eigen::Matrix<double, 6, 1> partnerContext() const { return partnerContext_; }
   void updatePartnerContext();
   void resetPartnerContext();
+  /** The policy's OWN applied force, as context: 1 s EMA of the force vector and of its
+   * magnitude, from the force this controller applied (policyForce_), decimated exactly as the
+   * extractor decimates a partner force. cpih.policy.context.own_force_context is the offline
+   * twin. Person A acts above the F/T sensor, so the partner context only ever sees B's
+   * reaction; this is the push that reaction answers. Called every tick AFTER
+   * updatePolicyPartner(), so ring slot t holds the force logged at tick t. */
+  void updateOwnForceContext();
 
   /** Position and velocity of a point rigidly attached to a body, world frame.
    *
@@ -299,6 +306,15 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * strided position sample sits when the window closes. */
   std::array<Eigen::Vector3d, 11> ctxForceRing_;
   std::array<Eigen::Vector3d, 6> ctxPosRing_;
+  /** Append the own-force context (4 values) after the partner context. Off by default for
+   * the same reason partner_context is: the width is part of the checkpoint. */
+  bool policyOwnForceContext_ = false;
+  Eigen::Vector4d ownForceContext_ = Eigen::Vector4d::Zero();
+  Eigen::Vector3d ownForceBar_ = Eigen::Vector3d::Zero();
+  double ownFMagBar_ = 0.0;
+  bool ownSeeded_ = false;
+  int ownTick_ = 0;
+  std::array<Eigen::Vector3d, 11> ownForceRing_;
   std::string policyRefBody_;
   Eigen::Vector3d policyRefPoint_ = Eigen::Vector3d::Zero();
   /** First-order filter on the differentiated intent, as a per-policy-step blend factor.
