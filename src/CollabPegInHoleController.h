@@ -315,6 +315,25 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * `max_force`. Limiting the step keeps the direction the policy asked for and spends more
    * ticks getting there -- which is what the hand it is imitating would have done. */
   double policyMaxIntentSpeed_ = 0.0;
+  /** First-order low-pass on the PREDICTION, in seconds. 0 disables it, which is what every
+   * configuration before this gets, so it changes nothing until asked for.
+   *
+   * Aimed at the ~1 Hz oscillation the policy carries into leader A (11.7 mm rms against a
+   * 1.5 mm clearance). A first-order filter attenuates by 1/sqrt(1 + (2*pi*f*tau)^2), so
+   * tau = 0.25 s cuts 1 Hz to 54 % while leaving the task itself alone: the descent takes ~20 s,
+   * three orders of magnitude below the corner.
+   *
+   * Filtering the PREDICTION and not the rebuilt reference, for the reason the rate limiter's
+   * comment gives above: in the relative action space the reference is supposed to track the
+   * hand, so smoothing the sum would fight that and make `intent - hand` grow. Smoothing the
+   * displacement leaves the hand-following intact and damps only what the policy asked for on
+   * top of it.
+   *
+   * NOT the same thing as policyVelocityFilter_, which smooths the derivative fed to the
+   * impedance's damping term; this smooths the position the spring pulls towards. */
+  double policyIntentFilterTau_ = 0.0;
+  Eigen::Vector3d filteredCommand_ = Eigen::Vector3d::Zero();
+  bool haveFilteredCommand_ = false;
   /** Whether the policy predicts a *displacement from its own hand* rather than a world
    * point. False is the absolute action space every policy before this was trained in.
    *

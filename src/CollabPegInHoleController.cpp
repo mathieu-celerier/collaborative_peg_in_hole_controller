@@ -189,6 +189,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("reference_point", policyRefPoint_);
     pconfig("velocity_filter", policyVelocityFilter_);
     pconfig("max_intent_speed", policyMaxIntentSpeed_);
+    pconfig("intent_filter_tau", policyIntentFilterTau_);
     pconfig("relative_intent", policyRelativeIntent_);
     pconfig("log_observation", logPolicyObservation_);
     pconfig("partner_context", policyPartnerContext_);
@@ -1321,6 +1322,32 @@ void CollabPegInHoleController::updateIntentReference(const Eigen::Vector3d & pr
   lastCommand_ = command;
   haveLastCommand_ = true;
 
+  // Low-pass the displacement before it becomes a reference. AFTER lastCommand_ is stored, so
+  // the rate limiter keeps measuring steps between raw predictions: the two bounds answer
+  // different questions -- how far a chunk jumped, and how fast the command wobbles -- and
+  // chaining them would let the filter hide the jumps the limiter exists to catch.
+  //
+  // Applied to the displacement rather than to the rebuilt point, for the reason the limiter's
+  // own comment gives: in the relative space the reference is supposed to follow the hand, and
+  // smoothing the sum would fight that and make `intent - hand` grow.
+  if(policyIntentFilterTau_ > 0.0)
+  {
+    if(!haveFilteredCommand_)
+    {
+      // Seeded from the episode's first command rather than from zero: starting at the origin
+      // would drag the opening reference towards the hand and spend the first second climbing
+      // back out, which is the window leader-A-stiff can least afford.
+      filteredCommand_ = command;
+      haveFilteredCommand_ = true;
+    }
+    else
+    {
+      const double a = std::exp(-interval / policyIntentFilterTau_);
+      filteredCommand_ = a * filteredCommand_ + (1.0 - a) * command;
+    }
+    command = filteredCommand_;
+  }
+
   // A relative policy predicts where its hand should go *from where its hand is*. Everything
   // below this line -- the reference velocity, the impedance, the saturation, the refAccel_
   // injection -- then sees the same absolute reference it always did.
@@ -1382,6 +1409,7 @@ void CollabPegInHoleController::updatePolicyPartner()
     policyRefVelocity_.setZero();
     haveLastIntent_ = false;
     haveLastCommand_ = false;
+    haveFilteredCommand_ = false;
     policySaturated_ = false;
     policyIntentLimited_ = false;
     // The anchor is per-episode: it is taken again, from wherever the next episode's hand
