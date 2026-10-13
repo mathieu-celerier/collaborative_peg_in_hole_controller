@@ -194,6 +194,23 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("log_observation", logPolicyObservation_);
     pconfig("partner_context", policyPartnerContext_);
     pconfig("own_force_context", policyOwnForceContext_);
+    if(pconfig.has("context_override"))
+    {
+      // A diagnostic, not a feature: from `time` (episode clock) the five estimated channels are
+      // replaced by fixed values, so a policy can be handed the answer the estimator would
+      // eventually reach and its own response time measured without the estimator's.
+      auto o = pconfig("context_override");
+      ctxOverrideTime_ = o("time");
+      std::vector<double> v = o("values");
+      if(v.size() != 5 || ctxOverrideTime_ < 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[CollabPegInHole] policy context_override needs time >= 0 and five values "
+            "(f_mean, f_var, v_mean, k, c); age is never overridden.");
+      }
+      for(int i = 0; i < 5; ++i) { ctxOverride_(i) = v[static_cast<std::size_t>(i)]; }
+      mc_rtc::log::warning("[CollabPegInHole] partner context OVERRIDDEN from {:.1f} s: diagnostic run", ctxOverrideTime_);
+    }
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
     pconfig("remote_port", policyRemotePort_);
@@ -1283,6 +1300,11 @@ void CollabPegInHoleController::updatePartnerContext()
   partnerContext_(3) = std::clamp(k / 1000.0, -kCtxKClip, kCtxKClip);
   partnerContext_(4) = std::clamp(c / 1000.0, -kCtxCClip, kCtxCClip);
   partnerContext_(5) = std::min(ctxAge_, kCtxAgeMax);
+  if(ctxOverrideTime_ >= 0.0 && ctxAge_ >= ctxOverrideTime_)
+  {
+    // The estimator keeps running underneath, so the log of its own state is unaffected.
+    partnerContext_.head<5>() = ctxOverride_;
+  }
   ctxAge_ += dt;  // so the first step reports 0, exactly as the exporter's first row does
 }
 

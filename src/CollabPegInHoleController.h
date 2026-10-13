@@ -276,6 +276,10 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * dead policy. Turn it on only for a checkpoint trained with the key in --state_keys. */
   bool policyPartnerContext_ = false;
   Eigen::Matrix<double, 6, 1> partnerContext_ = Eigen::Matrix<double, 6, 1>::Zero();
+  /** Diagnostic: from this episode time the first five context values are `ctxOverride_`.
+   * Negative (the default) never overrides. */
+  double ctxOverrideTime_ = -1.0;
+  Eigen::Matrix<double, 5, 1> ctxOverride_ = Eigen::Matrix<double, 5, 1>::Zero();
   /** Estimator state. Reset at every episode start, exactly as the exporter starts each
    * episode's sequence from its own first sample. */
   Eigen::Vector3d ctxPosBar_ = Eigen::Vector3d::Zero();
