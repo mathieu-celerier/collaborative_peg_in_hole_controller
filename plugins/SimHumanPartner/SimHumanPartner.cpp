@@ -351,6 +351,40 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
     }
 
     Eigen::Vector3d cursor = Eigen::Vector3d::Zero();
+    if(entry.has("switch"))
+    {
+      auto w = entry("switch");
+      auto & rs = p.roleSwitch;
+      rs.enabled = true;
+      w("time", rs.time);
+      w("ramp", rs.ramp);
+      w("stiffness", rs.stiffness);
+      w("damping", rs.damping);
+      if(rs.time <= 0.0 || rs.ramp < 0.0 || (rs.stiffness.array() < 0).any() || (rs.damping.array() < 0).any())
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[SimHumanPartner] partner '{}' has a role switch with a non-positive time, a negative "
+            "ramp or a negative gain.",
+            p.name);
+      }
+      if(w.has("search"))
+      {
+        auto s = w("search");
+        s("amplitude", rs.search.amplitude);
+        s("frequency", rs.search.frequency);
+        s("contact_force", rs.search.contactForce);
+        s("stall_time", rs.search.stallTime);
+        s("hold_time", rs.search.holdTime);
+        s("stall_motion", rs.search.stallMotion);
+        s("spiral_time", rs.search.spiralTime);
+        s("ramp_time", rs.search.rampTime);
+      }
+      mc_rtc::log::info("[SimHumanPartner] '{}' changes role at {:.1f} s over {:.1f} s: kp {:.1f} -> {:.1f} N/m, "
+                        "search {:.1f} -> {:.1f} mm",
+                        p.name, rs.time, rs.ramp, p.stiffness.x(), rs.stiffness.x(), p.search.amplitude * 1000.0,
+                        rs.search.amplitude * 1000.0);
+    }
+
     entry("start", cursor);
     double clock = p.startDelay;
     std::vector<mc_rtc::Configuration> waypoints = entry("waypoints", std::vector<mc_rtc::Configuration>{});
@@ -380,6 +414,7 @@ void SimHumanPartner::parsePartners(const mc_rtc::Configuration & config)
     p.configuredStart = p.segments.front().from;
     p.configuredFinalTarget = p.finalTarget;
     p.configuredStiffness = p.stiffness;
+    p.configuredSearch = p.search;
     p.configuredDamping = p.damping;
     p.configuredDelay = p.delay;
     p.configuredStartDelay = p.startDelay;
@@ -463,6 +498,8 @@ void SimHumanPartner::drawEpisodeNoise()
   {
     p.targetOffset.setZero();
     p.gainScale = 1.0;
+    p.search = p.configuredSearch;
+    p.switched = false;
     p.stiffness = p.configuredStiffness;
     p.damping = p.configuredDamping;
     p.delay = p.configuredDelay;
@@ -733,6 +770,22 @@ void SimHumanPartner::before(mc_control::MCGlobalController & controller)
 
   for(auto & p : partners_)
   {
+    // A role switch interpolates between the configured gains and the new role's, both under
+    // this episode's draw. A passive partner (zero configured gains) stays passive.
+    const bool passive = p.configuredStiffness.isZero() && p.configuredDamping.isZero();
+    if(p.roleSwitch.enabled && !passive && phase_ == Phase::Recording && clock >= p.roleSwitch.time)
+    {
+      const auto & rs = p.roleSwitch;
+      const double a = std::clamp((clock - rs.time) / std::max(rs.ramp, dt_), 0.0, 1.0);
+      p.stiffness = p.gainScale * ((1.0 - a) * p.configuredStiffness + a * rs.stiffness);
+      p.damping = p.gainScale * ((1.0 - a) * p.configuredDamping + a * rs.damping);
+      if(a >= 1.0 && !p.switched)
+      {
+        p.search = rs.search;
+        p.switched = true;
+      }
+    }
+
     // The error is measured at the point the person is aiming, which is the point they push
     // through -- anchoring the spring anywhere else makes it blind to the motion it causes.
     // See the Partner docs. Read before the reference because a state-fed partner's reference
@@ -1248,6 +1301,12 @@ void SimHumanPartner::addLog(mc_control::MCGlobalController & controller)
     logger.addLogEntry(prefix + "_target_offset",
                        [this, i]() -> const Eigen::Vector3d & { return partners_[i].targetOffset; });
     logger.addLogEntry(prefix + "_gain_scale", [this, i]() { return partners_[i].gainScale; });
+    if(partners_[i].roleSwitch.enabled)
+    {
+      // Only with a switch, so the columns of every other run are unchanged.
+      logger.addLogEntry(prefix + "_stiffness", [this, i]() { return partners_[i].stiffness.x(); });
+      logger.addLogEntry(prefix + "_switched", [this, i]() { return partners_[i].switched; });
+    }
     logger.addLogEntry(prefix + "_delay", [this, i]() { return partners_[i].delay; });
     logger.addLogEntry(prefix + "_delivered", [this, i]() { return partners_[i].delivered; });
     // The search, logged whether or not it is enabled: an episode where nobody wiggled and one

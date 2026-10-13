@@ -248,6 +248,29 @@ private:
       bool rampsExplicitly() const { return rampTime > 0.0; }
     };
     Search search;
+    /** The search as configured, restored at every episode so a role switch never carries over. */
+    Search configuredSearch;
+
+    /** A change of leadership partway through the episode.
+     *
+     * Leadership is not something this plugin models: it arrives as the gains and the search
+     * share the generator solved for a regime. A partner who changes role is therefore one
+     * whose gains move from the configured ones to `stiffness`/`damping` over `ramp` seconds
+     * from `time`, both scaled by the episode's gain draw, and whose search is handed over once
+     * the ramp is complete -- at the soft end of a lead-to-follow switch, so a dither being
+     * withdrawn does not jump a stiff spring. */
+    struct RoleSwitch
+    {
+      bool enabled = false;
+      double time = 0.0; // s, episode clock
+      double ramp = 1.0; // s
+      Eigen::Vector3d stiffness = Eigen::Vector3d::Zero();
+      Eigen::Vector3d damping = Eigen::Vector3d::Zero();
+      Search search;
+    };
+    RoleSwitch roleSwitch;
+    /** Whether this episode's search has been handed to the new role. */
+    bool switched = false;
 
     /** Reading the plan from the robot's state instead of from the clock.
      *
