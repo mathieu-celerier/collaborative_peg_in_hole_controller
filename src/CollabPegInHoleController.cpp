@@ -194,6 +194,7 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("log_observation", logPolicyObservation_);
     pconfig("partner_context", policyPartnerContext_);
     pconfig("own_force_context", policyOwnForceContext_);
+    pconfig("probe_context", policyProbeContext_);
     if(pconfig.has("context_estimator"))
     {
       // Must match the dataset the policy was trained on (replace_partner_context.py writes it
@@ -227,6 +228,20 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       }
       for(int i = 0; i < 5; ++i) { ctxOverride_(i) = v[static_cast<std::size_t>(i)]; }
       mc_rtc::log::warning("[CollabPegInHole] partner context OVERRIDDEN from {:.1f} s: diagnostic run", ctxOverrideTime_);
+    }
+    if(pconfig.has("probe"))
+    {
+      auto pr = pconfig("probe");
+      probeAmplitude_ = pr("amplitude");
+      probeFrequency_ = pr("frequency");
+      if(probeAmplitude_ < 0.0 || probeFrequency_ <= 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[CollabPegInHole] policy probe needs amplitude >= 0 and frequency > 0, got {} and {}", probeAmplitude_,
+            probeFrequency_);
+      }
+      mc_rtc::log::info("[CollabPegInHole] probing push: {:.2f} N at {:.2f} Hz, vertical", probeAmplitude_,
+                        probeFrequency_);
     }
     pconfig("replay", policyReplayPath_);
     pconfig("remote_host", policyRemoteHost_);
@@ -1164,6 +1179,10 @@ void CollabPegInHoleController::resetPartnerContext()
   ownSeeded_ = false;
   ownTick_ = 0;
   ownForceRing_.fill(Eigen::Vector3d::Zero());
+  probeContext_.setZero();
+  prbZBar_ = prbFBar_ = 0.0;
+  prbZ1_ = prbZ2_ = prbF1_ = prbF2_ = {};
+  prbSeeded_ = false;
 }
 
 void CollabPegInHoleController::updateOwnForceContext()
@@ -1207,6 +1226,39 @@ void CollabPegInHoleController::updateOwnForceContext()
   ownFMagBar_ = a * ownFMagBar_ + (1.0 - a) * force.norm();
   ownForceContext_.head<3>() = ownForceBar_;
   ownForceContext_(3) = ownFMagBar_;
+}
+
+namespace
+{
+// cpih.policy.context's PROBE_* constants, verbatim.
+constexpr double kPrbTauHp = 0.25;   // high-pass on both signals [s]
+constexpr double kPrbTauLp = 0.3;    // each of the two low-pass stages [s]
+constexpr double kPrbZFloor = 1e-5;  // m
+constexpr double kPrbKClip = 2.0;    // kN/m
+} // namespace
+
+void CollabPegInHoleController::updateProbeContext(double posZ, double forceZ, int sample)
+{
+  const double aHp = std::exp(-kCtxRate / kPrbTauHp);
+  const double aLp = std::exp(-kCtxRate / kPrbTauLp);
+  if(!prbSeeded_)
+  {
+    prbZBar_ = posZ;
+    prbFBar_ = forceZ;
+    prbSeeded_ = true;
+  }
+  prbZBar_ = aHp * prbZBar_ + (1.0 - aHp) * posZ;
+  prbFBar_ = aHp * prbFBar_ + (1.0 - aHp) * forceZ;
+  // The probe's phase at dataset sample `sample` is 2 pi f (0.01 sample): the same clock the
+  // probe itself runs on (episodeTick_ + 1 at tick 10 sample).
+  const std::complex<double> ph = std::polar(1.0, -2.0 * M_PI * probeFrequency_ * sample * kCtxRate);
+  prbZ1_ = aLp * prbZ1_ + (1.0 - aLp) * (posZ - prbZBar_) * ph;
+  prbF1_ = aLp * prbF1_ + (1.0 - aLp) * (forceZ - prbFBar_) * ph;
+  prbZ2_ = aLp * prbZ2_ + (1.0 - aLp) * prbZ1_;
+  prbF2_ = aLp * prbF2_ + (1.0 - aLp) * prbF1_;
+  const double kb = -(prbF2_ * std::conj(prbZ2_)).real() / (std::norm(prbZ2_) + kPrbZFloor * kPrbZFloor);
+  probeContext_(0) = std::clamp(kb / 1000.0, -kPrbKClip, kPrbKClip);
+  probeContext_(1) = 2000.0 * std::abs(prbZ2_);
 }
 
 void CollabPegInHoleController::updatePartnerContext()
@@ -1267,6 +1319,7 @@ void CollabPegInHoleController::updatePartnerContext()
   }
   force = sampledForce;
   pos = sampledPos;
+  updateProbeContext(pos.z(), force.z(), sample);
 
   const double dt = kCtxRate;
   const double a = std::exp(-dt / kCtxTau);
@@ -1366,7 +1419,8 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
   // concatenates in the order given and measured_partner_context is named last there.
   // The own-force block, when on, comes after it: measured_own_force_context is named after
   // measured_partner_context in --state_keys.
-  const Eigen::Index width = 29 + (policyPartnerContext_ ? 6 : 0) + (policyOwnForceContext_ ? 4 : 0);
+  const Eigen::Index width =
+      29 + (policyPartnerContext_ ? 6 : 0) + (policyOwnForceContext_ ? 4 : 0) + (policyProbeContext_ ? 2 : 0);
   Eigen::VectorXd x = Eigen::VectorXd::Zero(width);
   for(std::size_t i = 0; i < 7 && i < q.size(); ++i) { x(static_cast<Eigen::Index>(i)) = q[i]; }
   for(std::size_t i = 0; i < 7 && i < dq.size(); ++i) { x(7 + static_cast<Eigen::Index>(i)) = dq[i]; }
@@ -1383,7 +1437,11 @@ Eigen::VectorXd CollabPegInHoleController::policyObservation() const
   }
   if(policyOwnForceContext_)
   {
-    x.tail<4>() = ownForceContext_;
+    x.segment<4>(29 + (policyPartnerContext_ ? 6 : 0)) = ownForceContext_;
+  }
+  if(policyProbeContext_)
+  {
+    x.tail<2>() = probeContext_;
   }
   return x;
 }
@@ -1522,6 +1580,7 @@ void CollabPegInHoleController::updatePolicyPartner()
     // does not clear it, so a stale feed-forward would keep pushing after the episode.
     if(compEETask) { compEETask->refAccel(Eigen::Vector6d::Zero()); }
     policyForce_.setZero();
+    probeForce_ = 0.0;
     policyAccel_.setZero();
     policyWrenchNorm_ = 0.0;
     // The intent's derivative must not survive a gap in which the arm kept moving: resuming
@@ -1611,6 +1670,7 @@ void CollabPegInHoleController::updatePolicyPartner()
           compEETask->refAccel(Eigen::Vector6d::Zero());
         }
         policyForce_.setZero();
+        probeForce_ = 0.0;
         policyAccel_.setZero();
         policyWrenchNorm_ = 0.0;
         ++policyTick_;
@@ -1631,6 +1691,17 @@ void CollabPegInHoleController::updatePolicyPartner()
                                     : Eigen::Vector3d(policy_->predict(policyObservation()).head<3>()));
     }
     policyForce_ = intentForce();
+  }
+  if(probeAmplitude_ > 0.0)
+  {
+    // On the clock of the sample this tick is logged under (episodeTick_ + 1, see the replay
+    // above), so sample i of an extracted episode carries A sin(2 pi f 0.01 i) exactly. Every
+    // tick rather than per policy step, and after the policy's own force, so neither the
+    // decimation nor the force bound reshapes it.
+    // The force path holds policyForce_ between policy steps, so last tick's probe is still in it.
+    const double held = policyOutputKind_ == "force" && !policyStep ? probeForce_ : 0.0;
+    probeForce_ = probeAmplitude_ * std::sin(2.0 * M_PI * probeFrequency_ * (episodeTick_ + 1) * timeStep);
+    policyForce_.z() += probeForce_ - held;
   }
   ++policyTick_;
 
@@ -1986,6 +2057,8 @@ void CollabPegInHoleController::addLog()
   // which of the two produced the demonstration rather than leaving it to the config file.
   logger().addLogEntry("collab_policy_active", this, [this]() -> double { return policyEnabled_ ? 1.0 : 0.0; });
   logger().addLogEntry("collab_policy_force", this, [this]() -> const Eigen::Vector3d & { return policyForce_; });
+  logger().addLogEntry("collab_probe_force", this, [this]() { return probeForce_; });
+  logger().addLogEntry("collab_probe_context", this, [this]() -> const Eigen::Vector2d & { return probeContext_; });
   logger().addLogEntry("collab_policy_accel", this, [this]() -> const Eigen::Vector6d & { return policyAccel_; });
   logger().addLogEntry("collab_policy_trigger", this, [this]() { return policyWrenchNorm_; });
   // The intent path's own state. Logged even on the force path, where it stays zero: a

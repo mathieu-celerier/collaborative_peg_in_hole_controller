@@ -13,6 +13,7 @@
 #include "api.h"
 
 #include <array>
+#include <complex>
 #include <deque>
 #include <map>
 #include <memory>
@@ -176,6 +177,10 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * reaction; this is the push that reaction answers. Called every tick AFTER
    * updatePolicyPartner(), so ring slot t holds the force logged at tick t. */
   void updateOwnForceContext();
+  /** Lock-in reading of the probing push: partner B's dynamic stiffness at the probe frequency
+   * and the tool's response amplitude, from the same 100 Hz samples as the partner context.
+   * cpih.policy.context.probe_context, verbatim; called from updatePartnerContext(). */
+  void updateProbeContext(double posZ, double forceZ, int sample);
 
   /** Position and velocity of a point rigidly attached to a body, world frame.
    *
@@ -287,6 +292,21 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * second, which forgets a step in force instead of reading it as variance. */
   bool ctxFVarWindow_ = false;
   double ctxTauFit_ = 5.0;
+  /** A probing push (`policy.probe`): a vertical sine of `probeAmplitude_` N at `probeFrequency_`
+   * Hz added to whatever the policy applies, phase-locked to the episode clock so the force is a
+   * known function of time offline. A stiff partner barely gives way to it and a compliant one
+   * does, which is what makes a partner who quietly stops leading observable at all: passively
+   * the two look alike (logs/pushscreen/). Zero amplitude (the default) is inert. */
+  double probeAmplitude_ = 0.0;
+  double probeFrequency_ = 0.0;
+  double probeForce_ = 0.0;
+  /** Append probeContext_ to the observation (`policy.probe_context`), after the own-force
+   * block: measured_probe_context is named last in --state_keys. */
+  bool policyProbeContext_ = false;
+  Eigen::Vector2d probeContext_ = Eigen::Vector2d::Zero();
+  double prbZBar_ = 0.0, prbFBar_ = 0.0;
+  std::complex<double> prbZ1_{}, prbZ2_{}, prbF1_{}, prbF2_{};
+  bool prbSeeded_ = false;
   /** |F| at the last 100 estimator steps (1 s), for the windowed f_var. */
   std::array<double, 100> ctxFMagWindow_{};
   int ctxFMagCount_ = 0;
