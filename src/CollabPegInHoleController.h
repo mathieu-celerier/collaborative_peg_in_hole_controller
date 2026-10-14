@@ -280,6 +280,16 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * Negative (the default) never overrides. */
   double ctxOverrideTime_ = -1.0;
   Eigen::Matrix<double, 5, 1> ctxOverride_ = Eigen::Matrix<double, 5, 1>::Zero();
+  /** The estimator variant (`policy.context_estimator`), which must be the one the policy's
+   * dataset was exported with: cpih.policy.context.partner_context's `fvar` and `tau_fit`.
+   * The defaults are the original estimator, which every dataset before 2026-10-14 used.
+   * `win` replaces f_var's deviation-from-a-lagging-mean by the std of |F| over the trailing
+   * second, which forgets a step in force instead of reading it as variance. */
+  bool ctxFVarWindow_ = false;
+  double ctxTauFit_ = 5.0;
+  /** |F| at the last 100 estimator steps (1 s), for the windowed f_var. */
+  std::array<double, 100> ctxFMagWindow_{};
+  int ctxFMagCount_ = 0;
   /** Estimator state. Reset at every episode start, exactly as the exporter starts each
    * episode's sequence from its own first sample. */
   Eigen::Vector3d ctxPosBar_ = Eigen::Vector3d::Zero();

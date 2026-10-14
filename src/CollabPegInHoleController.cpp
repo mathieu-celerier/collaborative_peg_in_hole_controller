@@ -194,6 +194,23 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     pconfig("log_observation", logPolicyObservation_);
     pconfig("partner_context", policyPartnerContext_);
     pconfig("own_force_context", policyOwnForceContext_);
+    if(pconfig.has("context_estimator"))
+    {
+      // Must match the dataset the policy was trained on (replace_partner_context.py writes it
+      // into each episode's attributes); check_context_agreement.py --fvar/--tau-fit checks it.
+      auto e = pconfig("context_estimator");
+      std::string fvar = "lag";
+      e("fvar", fvar);
+      e("tau_fit", ctxTauFit_);
+      if((fvar != "lag" && fvar != "win") || ctxTauFit_ <= 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[CollabPegInHole] policy context_estimator needs fvar lag|win and tau_fit > 0, got {} and {}", fvar,
+            ctxTauFit_);
+      }
+      ctxFVarWindow_ = fvar == "win";
+      mc_rtc::log::info("[CollabPegInHole] partner context estimator: f_var {}, fit {:.2f} s", fvar, ctxTauFit_);
+    }
     if(pconfig.has("context_override"))
     {
       // A diagnostic, not a feature: from `time` (episode clock) the five estimated channels are
@@ -1109,7 +1126,8 @@ namespace
 // cpih.policy.context's constants, verbatim. Changing one here without changing it there is a
 // silent train/serve skew; check_context_agreement.py is what catches it.
 constexpr double kCtxTau = 1.0;      // EMA time constant of the running means [s]
-constexpr double kCtxTauFit = 5.0;   // and of the regression accumulators [s]
+// The regression accumulators' time constant is ctxTauFit_ (5 s unless policy.context_estimator
+// says otherwise), and f_var's variant ctxFVarWindow_: both name the dataset's export.
 constexpr double kCtxRidge = 1e-6;   // holds the fit near zero until the partner has moved the tool
 constexpr double kCtxKClip = 2.0;    // kN/m
 constexpr double kCtxCClip = 2.0;    // kNs/m
@@ -1136,6 +1154,8 @@ void CollabPegInHoleController::resetPartnerContext()
   ctxSeeded_ = false;
   ctxAge_ = 0.0;
   ctxTick_ = 0;
+  ctxFMagWindow_.fill(0.0);
+  ctxFMagCount_ = 0;
   ctxForceRing_.fill(Eigen::Vector3d::Zero());
   ctxPosRing_.fill(Eigen::Vector3d::Zero());
   ownForceContext_.setZero();
@@ -1250,7 +1270,7 @@ void CollabPegInHoleController::updatePartnerContext()
 
   const double dt = kCtxRate;
   const double a = std::exp(-dt / kCtxTau);
-  const double aFit = std::exp(-dt / kCtxTauFit);
+  const double aFit = std::exp(-dt / ctxTauFit_);
 
   if(!ctxSeeded_)
   {
@@ -1295,7 +1315,23 @@ void CollabPegInHoleController::updatePartnerContext()
   }
 
   partnerContext_(0) = ctxFMagBar_;
-  partnerContext_(1) = std::sqrt(std::max(ctxFDevBar_, 0.0));
+  // The trailing window is kept whichever variant is served, so switching is a config change.
+  ctxFMagWindow_[static_cast<std::size_t>(ctxFMagCount_) % ctxFMagWindow_.size()] = fMag;
+  ++ctxFMagCount_;
+  if(ctxFVarWindow_)
+  {
+    // numpy's std over fmag[max(t-99, 0) : t+1]: population, two-pass.
+    const int n = std::min(ctxFMagCount_, static_cast<int>(ctxFMagWindow_.size()));
+    double mean = 0.0, var = 0.0;
+    for(int j = 0; j < n; ++j) { mean += ctxFMagWindow_[static_cast<std::size_t>(j)]; }
+    mean /= n;
+    for(int j = 0; j < n; ++j) { var += std::pow(ctxFMagWindow_[static_cast<std::size_t>(j)] - mean, 2); }
+    partnerContext_(1) = std::sqrt(var / n);
+  }
+  else
+  {
+    partnerContext_(1) = std::sqrt(std::max(ctxFDevBar_, 0.0));
+  }
   partnerContext_(2) = ctxVMagBar_;
   partnerContext_(3) = std::clamp(k / 1000.0, -kCtxKClip, kCtxKClip);
   partnerContext_(4) = std::clamp(c / 1000.0, -kCtxCClip, kCtxCClip);
