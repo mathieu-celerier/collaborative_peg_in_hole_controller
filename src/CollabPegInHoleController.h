@@ -291,11 +291,22 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * again, and the detector re-arms. A dyad in which both sides wait for the other to lead
    * stands still, and a standstill gives the estimator nothing to revise its belief with; the
    * policy's own leading push is what breaks it, and is itself the test of whether the partner
-   * still leads (one who does resists it). Negative stall speed (the default) is inert. */
+   * still leads (one who does resists it). Negative stall speed (the default) is inert.
+   * With `release_w` (five weights) and `release_b`, `hold` is only a cap: the lead ends once
+   * the estimate underneath reads a following partner (release_w . estimate + release_b >= 0)
+   * for `initReleaseTime_`. A fixed hold hands back to an estimate that still reads a leader:
+   * leading in the pause is a push too small to change it in two seconds. */
   double initStallSpeed_ = -1.0;
   double initStallTime_ = 1.0;
   double initHold_ = 2.0;
   double initMinAge_ = 2.0;
+  bool initRelease_ = false;
+  Eigen::Matrix<double, 5, 1> initReleaseW_ = Eigen::Matrix<double, 5, 1>::Zero();
+  double initReleaseB_ = 0.0;
+  double initReleaseTime_ = 1.0;
+  double initAgreeClock_ = 0.0;
+  /** release_w . estimate + release_b, every step (whether or not a lead is on), for the log. */
+  double initScore_ = 0.0;
   Eigen::Matrix<double, 5, 1> initValues_ = Eigen::Matrix<double, 5, 1>::Zero();
   std::array<Eigen::Vector3d, 11> initPosRing_{};
   double initStallClock_ = 0.0;

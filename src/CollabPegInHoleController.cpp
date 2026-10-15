@@ -236,6 +236,15 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       initStallTime_ = in("stall_time");
       initHold_ = in("hold");
       in("min_age", initMinAge_);
+      if(in.has("release_w"))
+      {
+        std::vector<double> w = in("release_w");
+        if(w.size() != 5) { mc_rtc::log::error_and_throw<std::runtime_error>("[CollabPegInHole] initiative release_w needs five weights"); }
+        for(int i = 0; i < 5; ++i) { initReleaseW_(i) = w[static_cast<std::size_t>(i)]; }
+        initReleaseB_ = in("release_b");
+        in("release_time", initReleaseTime_);
+        initRelease_ = true;
+      }
       std::vector<double> v = in("values");
       if(v.size() != 5 || initStallSpeed_ <= 0.0 || initStallTime_ <= 0.0 || initHold_ <= 0.0)
       {
@@ -246,6 +255,11 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       for(int i = 0; i < 5; ++i) { initValues_(i) = v[static_cast<std::size_t>(i)]; }
       mc_rtc::log::info("[CollabPegInHole] initiative: lead for {:.1f} s after {:.1f} s below {:.1f} mm/s (from {:.1f} s)",
                         initHold_, initStallTime_, 1000.0 * initStallSpeed_, initMinAge_);
+      if(initRelease_)
+      {
+        mc_rtc::log::info("[CollabPegInHole] initiative: ... or until the estimate reads a follower for {:.1f} s",
+                          initReleaseTime_);
+      }
     }
     if(pconfig.has("probe"))
     {
@@ -1199,7 +1213,7 @@ void CollabPegInHoleController::resetPartnerContext()
   ownForceRing_.fill(Eigen::Vector3d::Zero());
   probeContext_.setZero();
   initPosRing_.fill(Eigen::Vector3d::Zero());
-  initStallClock_ = initHoldLeft_ = initSpeed_ = initActive_ = 0.0;
+  initStallClock_ = initHoldLeft_ = initSpeed_ = initActive_ = initAgreeClock_ = initScore_ = 0.0;
   initCount_ = 0;
   prbZBar_ = prbFBar_ = 0.0;
   prbZ1_ = prbZ2_ = prbF1_ = prbF2_ = {};
@@ -1424,10 +1438,17 @@ void CollabPegInHoleController::updatePartnerContext()
                                 / (back * dt)
                           : 0.0;
     initActive_ = 0.0;
+    // partnerContext_ still holds this tick's estimate here; the override is applied below.
+    if(initRelease_) { initScore_ = initReleaseW_.dot(partnerContext_.head<5>()) + initReleaseB_; }
     if(initHoldLeft_ > 0.0)
     {
       initHoldLeft_ -= dt;
       initActive_ = 1.0;
+      if(initRelease_)
+      {
+        initAgreeClock_ = initScore_ >= 0.0 ? initAgreeClock_ + dt : 0.0;
+        if(initAgreeClock_ >= initReleaseTime_ - 1e-9) { initHoldLeft_ = 0.0; }
+      }
     }
     else if(ctxAge_ >= initMinAge_)
     {
@@ -1436,6 +1457,7 @@ void CollabPegInHoleController::updatePartnerContext()
       {
         initHoldLeft_ = initHold_ - dt;
         initStallClock_ = 0.0;
+        initAgreeClock_ = 0.0;
         initActive_ = 1.0;
         ++initCount_;
       }
@@ -2108,6 +2130,7 @@ void CollabPegInHoleController::addLog()
   logger().addLogEntry("collab_probe_force", this, [this]() { return probeForce_; });
   logger().addLogEntry("collab_initiative_active", this, [this]() { return initActive_; });
   logger().addLogEntry("collab_initiative_speed", this, [this]() { return initSpeed_; });
+  logger().addLogEntry("collab_initiative_score", this, [this]() { return initScore_; });
   logger().addLogEntry("collab_probe_context", this, [this]() -> const Eigen::Vector2d & { return probeContext_; });
   logger().addLogEntry("collab_policy_accel", this, [this]() -> const Eigen::Vector6d & { return policyAccel_; });
   logger().addLogEntry("collab_policy_trigger", this, [this]() { return policyWrenchNorm_; });
