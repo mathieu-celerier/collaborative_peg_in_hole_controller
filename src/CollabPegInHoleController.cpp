@@ -229,6 +229,24 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
       for(int i = 0; i < 5; ++i) { ctxOverride_(i) = v[static_cast<std::size_t>(i)]; }
       mc_rtc::log::warning("[CollabPegInHole] partner context OVERRIDDEN from {:.1f} s: diagnostic run", ctxOverrideTime_);
     }
+    if(pconfig.has("initiative"))
+    {
+      auto in = pconfig("initiative");
+      initStallSpeed_ = in("stall_speed");
+      initStallTime_ = in("stall_time");
+      initHold_ = in("hold");
+      in("min_age", initMinAge_);
+      std::vector<double> v = in("values");
+      if(v.size() != 5 || initStallSpeed_ <= 0.0 || initStallTime_ <= 0.0 || initHold_ <= 0.0)
+      {
+        mc_rtc::log::error_and_throw<std::runtime_error>(
+            "[CollabPegInHole] policy initiative needs stall_speed, stall_time, hold > 0 and five values "
+            "(f_mean, f_var, v_mean, k, c)");
+      }
+      for(int i = 0; i < 5; ++i) { initValues_(i) = v[static_cast<std::size_t>(i)]; }
+      mc_rtc::log::info("[CollabPegInHole] initiative: lead for {:.1f} s after {:.1f} s below {:.1f} mm/s (from {:.1f} s)",
+                        initHold_, initStallTime_, 1000.0 * initStallSpeed_, initMinAge_);
+    }
     if(pconfig.has("probe"))
     {
       auto pr = pconfig("probe");
@@ -1180,6 +1198,9 @@ void CollabPegInHoleController::resetPartnerContext()
   ownTick_ = 0;
   ownForceRing_.fill(Eigen::Vector3d::Zero());
   probeContext_.setZero();
+  initPosRing_.fill(Eigen::Vector3d::Zero());
+  initStallClock_ = initHoldLeft_ = initSpeed_ = initActive_ = 0.0;
+  initCount_ = 0;
   prbZBar_ = prbFBar_ = 0.0;
   prbZ1_ = prbZ2_ = prbF1_ = prbF2_ = {};
   prbSeeded_ = false;
@@ -1393,6 +1414,33 @@ void CollabPegInHoleController::updatePartnerContext()
   {
     // The estimator keeps running underneath, so the log of its own state is unaffected.
     partnerContext_.head<5>() = ctxOverride_;
+  }
+  if(initStallSpeed_ > 0.0)
+  {
+    // Speed over the last 0.1 s of strided samples: one sample is too noisy to call a stall.
+    initPosRing_[static_cast<std::size_t>(sample) % initPosRing_.size()] = pos;
+    const int back = std::min(sample, static_cast<int>(initPosRing_.size()) - 1);
+    initSpeed_ = back > 0 ? (pos - initPosRing_[static_cast<std::size_t>(sample - back) % initPosRing_.size()]).norm()
+                                / (back * dt)
+                          : 0.0;
+    initActive_ = 0.0;
+    if(initHoldLeft_ > 0.0)
+    {
+      initHoldLeft_ -= dt;
+      initActive_ = 1.0;
+    }
+    else if(ctxAge_ >= initMinAge_)
+    {
+      initStallClock_ = initSpeed_ < initStallSpeed_ ? initStallClock_ + dt : 0.0;
+      if(initStallClock_ >= initStallTime_ - 1e-9)
+      {
+        initHoldLeft_ = initHold_ - dt;
+        initStallClock_ = 0.0;
+        initActive_ = 1.0;
+        ++initCount_;
+      }
+    }
+    if(initActive_ > 0.0) { partnerContext_.head<5>() = initValues_; }
   }
   ctxAge_ += dt;  // so the first step reports 0, exactly as the exporter's first row does
 }
@@ -2058,6 +2106,8 @@ void CollabPegInHoleController::addLog()
   logger().addLogEntry("collab_policy_active", this, [this]() -> double { return policyEnabled_ ? 1.0 : 0.0; });
   logger().addLogEntry("collab_policy_force", this, [this]() -> const Eigen::Vector3d & { return policyForce_; });
   logger().addLogEntry("collab_probe_force", this, [this]() { return probeForce_; });
+  logger().addLogEntry("collab_initiative_active", this, [this]() { return initActive_; });
+  logger().addLogEntry("collab_initiative_speed", this, [this]() { return initSpeed_; });
   logger().addLogEntry("collab_probe_context", this, [this]() -> const Eigen::Vector2d & { return probeContext_; });
   logger().addLogEntry("collab_policy_accel", this, [this]() -> const Eigen::Vector6d & { return policyAccel_; });
   logger().addLogEntry("collab_policy_trigger", this, [this]() { return policyWrenchNorm_; });

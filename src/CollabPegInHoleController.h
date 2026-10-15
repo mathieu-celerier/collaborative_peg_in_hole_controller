@@ -285,6 +285,25 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
    * Negative (the default) never overrides. */
   double ctxOverrideTime_ = -1.0;
   Eigen::Matrix<double, 5, 1> ctxOverride_ = Eigen::Matrix<double, 5, 1>::Zero();
+  /** Initiative (`policy.initiative`): when the tool has moved slower than `initStallSpeed_`
+   * for `initStallTime_` (after `initMinAge_` into the episode), the first five context values
+   * are `initValues_` -- a leading partner's -- for `initHold_` seconds, then the estimate
+   * again, and the detector re-arms. A dyad in which both sides wait for the other to lead
+   * stands still, and a standstill gives the estimator nothing to revise its belief with; the
+   * policy's own leading push is what breaks it, and is itself the test of whether the partner
+   * still leads (one who does resists it). Negative stall speed (the default) is inert. */
+  double initStallSpeed_ = -1.0;
+  double initStallTime_ = 1.0;
+  double initHold_ = 2.0;
+  double initMinAge_ = 2.0;
+  Eigen::Matrix<double, 5, 1> initValues_ = Eigen::Matrix<double, 5, 1>::Zero();
+  std::array<Eigen::Vector3d, 11> initPosRing_{};
+  double initStallClock_ = 0.0;
+  double initHoldLeft_ = 0.0;
+  double initSpeed_ = 0.0;
+  /** 1 while the initiative overrides the context, for the log. */
+  double initActive_ = 0.0;
+  int initCount_ = 0;
   /** The estimator variant (`policy.context_estimator`), which must be the one the policy's
    * dataset was exported with: cpih.policy.context.partner_context's `fvar` and `tau_fit`.
    * The defaults are the original estimator, which every dataset before 2026-10-14 used.
