@@ -55,6 +55,8 @@ CollabPegInHoleController::CollabPegInHoleController(mc_rbdyn::RobotModulePtr rm
     rconfig("ee_hold_stiffness", eeHoldStiffness_);
     rconfig("ee_hold_damping", eeHoldDamping_);
     rconfig("ee_free_damping", eeFreeDamping_);
+    rconfig("ee_free_orientation_stiffness", eeFreeOrientationStiffness_);
+    rconfig("ee_free_orientation_damping", eeFreeOrientationDamping_);
     rconfig("ee_orientation_compliant", eeOrientationCompliant_);
     rconfig("ee_up_vector_enabled", eeUpVectorEnabled_);
     rconfig("ee_orientation_weight", eeOrientationWeight_);
@@ -867,6 +869,8 @@ void CollabPegInHoleController::switchToCompliantState()
   triggerSum_ = 0.0;
   currentEEStiffness_ = eeHoldStiffness_;
   currentEEDamping_ = eeHoldDamping_;
+  currentEEOrientationStiffness_ = eeHoldStiffness_;
+  currentEEOrientationDamping_ = eeHoldDamping_;
   holdEndEffector();
 
   // Keep the plate level, and only that. The vector held is whichever tool-frame direction
@@ -901,7 +905,7 @@ void CollabPegInHoleController::holdEndEffector()
   compEETask->orientationTask->reset();
   compEETask->orientationTask->weight(eeUpVectorEnabled_ && eeOrientationWeight_ >= 0.0 ? eeOrientationWeight_
                                                                                         : eeTaskWeight_);
-  compEETask->orientationTask->setGains(currentEEStiffness_, currentEEDamping_);
+  compEETask->orientationTask->setGains(currentEEOrientationStiffness_, currentEEOrientationDamping_);
   applyEECompliance(false);
 }
 
@@ -923,8 +927,9 @@ void CollabPegInHoleController::applyEECompliance(bool free)
   // from the angular axes is what "the orientation is not compliant" means here -- an external
   // wrench moves the plate without turning it.
   //
-  // Nothing else about the orientation task changes: its gains still ramp down with the
-  // translation's, and its target is still re-latched every tick. That matters. Pairing this
+  // By default nothing else about the orientation task changes: its gains still ramp down with
+  // the translation's, and its target is still re-latched every tick. That matters.
+  // ee_free_orientation_stiffness > 0 is the exception: a soft spring on the latched target. Pairing this
   // with gains pinned at 400 on a target left where it was latched diverges inside 10 ms -- a
   // stiff task with no feed-forward chases the estimator's noise, which at Compliant entry
   // swings +/-100 rad/s^2. Damping rotation is achievable; holding an exact orientation
@@ -1095,7 +1100,7 @@ void CollabPegInHoleController::updateDualCompliance()
   {
     // Falling edge (free -> hold): latch the target at the current pose, then stiffen.
     dualFree_ = false;
-    compEETask->reset();
+    relatchEETarget();
     applyEECompliance(false);
     mc_rtc::log::info("[CollabPegInHoleController] EE holding (wrench {:.1f})", triggerWrenchNorm_);
   }
@@ -1104,18 +1109,37 @@ void CollabPegInHoleController::updateDualCompliance()
   // pulling the plate back - it floats with the applied force + damping.
   if(dualFree_)
   {
-    compEETask->reset();
+    relatchEETarget();
   }
 
   // Layer 4: exponentially ramp the gains toward the target selected by dualFree_,
   // so stiffness/damping never jump instantaneously.
   const double targetStiffness = dualFree_ ? 0.0 : eeHoldStiffness_;
   const double targetDamping = dualFree_ ? eeFreeDamping_ : eeHoldDamping_;
+  const double freeOrientationDamping = eeFreeOrientationDamping_ < 0.0 ? eeFreeDamping_ : eeFreeOrientationDamping_;
+  const double targetOrientationStiffness = dualFree_ ? eeFreeOrientationStiffness_ : eeHoldStiffness_;
+  const double targetOrientationDamping = dualFree_ ? freeOrientationDamping : eeHoldDamping_;
   const double ga = std::exp(-timeStep / std::max(1e-3, gainTransitionTime_));
   currentEEStiffness_ = ga * currentEEStiffness_ + (1.0 - ga) * targetStiffness;
   currentEEDamping_ = ga * currentEEDamping_ + (1.0 - ga) * targetDamping;
+  currentEEOrientationStiffness_ = ga * currentEEOrientationStiffness_ + (1.0 - ga) * targetOrientationStiffness;
+  currentEEOrientationDamping_ = ga * currentEEOrientationDamping_ + (1.0 - ga) * targetOrientationDamping;
   compEETask->positionTask->setGains(currentEEStiffness_, currentEEDamping_);
-  compEETask->orientationTask->setGains(currentEEStiffness_, currentEEDamping_);
+  compEETask->orientationTask->setGains(currentEEOrientationStiffness_, currentEEOrientationDamping_);
+}
+
+void CollabPegInHoleController::relatchEETarget()
+{
+  // With a free-orientation spring, the orientation target stays where Compliant latched it,
+  // so the spring has something to pull back to; only the translation follows the hand.
+  if(eeFreeOrientationStiffness_ > 0.0)
+  {
+    compEETask->positionTask->reset();
+  }
+  else
+  {
+    compEETask->reset();
+  }
 }
 
 // --- Behaviour-cloned partner ------------------------------------------------------------
@@ -2232,6 +2256,8 @@ void CollabPegInHoleController::addLog()
   logger().addLogEntry("collab_trigger_norm_filtered", this, [this]() -> double { return filteredWrenchNorm_; });
   logger().addLogEntry("collab_trigger_norm_smoothed", this, [this]() -> double { return triggerWrenchNorm_; });
   logger().addLogEntry("collab_ee_stiffness", this, [this]() -> double { return currentEEStiffness_; });
+  logger().addLogEntry("collab_ee_orientation_stiffness", this,
+                       [this]() -> double { return currentEEOrientationStiffness_; });
   logger().addLogEntry("collab_ee_orientation_compliant", this, [this]() -> bool { return eeOrientationCompliant_; });
   logger().addLogEntry("collab_ft_wrench_norm_nograv", this,
                        [this]() -> double

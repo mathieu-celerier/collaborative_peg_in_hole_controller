@@ -69,6 +69,9 @@ struct CollabPegInHoleController_DLLAPI CollabPegInHoleController : public mc_co
   void updateDualCompliance();
   /** Reset the end-effector task to its stiff "hold" configuration. */
   void holdEndEffector();
+  /** Move the end-effector target onto the current pose: the translation always, the orientation
+   * only when there is no free-orientation spring (see `eeFreeOrientationStiffness_`). */
+  void relatchEETarget();
   /** Angle between the tool's up axis and world vertical, in radians. */
   double toolTilt() const;
   /** Apply the end-effector compliance for the current free/hold state.
@@ -589,6 +592,12 @@ private:
   double eeHoldStiffness_ = 400.0; // stiffness when holding position
   double eeHoldDamping_ = 40.0; // damping when holding position (ramp target)
   double eeFreeDamping_ = 15.0; // damping when free (stiffness 0)
+  /** Orientation gains while the end-effector is free. At 0 stiffness (the default) the rotation
+   * follows the translation: no spring, target re-latched every tick, so only damping opposes a
+   * twist. Above 0, the orientation keeps the target latched when Compliant started and springs
+   * back to it, while the translation still floats. Negative damping means eeFreeDamping_. */
+  double eeFreeOrientationStiffness_ = 0.0;
+  double eeFreeOrientationDamping_ = -1.0;
   /** Whether freeing the end-effector also frees the plate's orientation in the 6d task.
    *
    * The default matches the shipped yaml, which is false. It used to be true, justified by
@@ -645,6 +654,8 @@ private:
   double triggerSum_ = 0.0; // running sum of triggerHistory_
   double currentEEStiffness_ = 400.0; // ramped end-effector stiffness
   double currentEEDamping_ = 40.0; // ramped end-effector damping
+  double currentEEOrientationStiffness_ = 400.0; // ramped orientation stiffness
+  double currentEEOrientationDamping_ = 40.0; // ramped orientation damping
   // Warn-once flags so diagnostics don't spam every control tick.
   bool warnedNoFtSensor_ = false;
   bool warnedNoEstimator_ = false;
