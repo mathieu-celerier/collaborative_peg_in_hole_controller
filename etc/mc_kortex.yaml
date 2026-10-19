@@ -1,0 +1,32 @@
+# mc_kortex settings for the real arm, appended to MC_RTC_CONTROLLER_CONFIG by the nix shells
+# (flake.nix, extraConfigFiles). The generated mc_rtc.yaml sets `LoadUserConfiguration: false`,
+# so ~/.config/mc_rtc/mc_rtc.yaml is not read. Values match the ones the Gen3 with brakes runs
+# with in monodzukuri2024_kinova_demo's etc/mc_kortex.yaml.
+Kortex:
+  init_posture:
+    on_startup: false
+    posture: [0.0, 0.4173, 3.1292, -2.1829, 0.0, 1.0342, 1.5226]
+
+  # bypass needs routes to the actuators (10.10.0.10-17 via the base), see the mc_kortex README
+  low_level_type: bypass
+  # How long into a tick its feedback is awaited (us)
+  feedback_wait_us: 750
+
+  torque_control:
+    mode: custom
+    lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    friction_compensation:
+      velocity_threshold: 0.05 # rad/s
+      acceleration_threshold: 5.0 # rad/s^2
+      stiction: [3.5, 3.5, 3.5, 3.5, 1.2, 1.2, 1.2]
+      coulomb: [3.5, 3.5, 3.5, 3.5, 1.2, 1.2, 1.2]
+      viscous: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    integral_term:
+      theta: 2
+      gain: 10
+
+  # Keyed on the mc_kinova variant string, like the controller's own per-robot block
+  kinova_bota_peg_plate:
+    ip: 192.168.1.10
+    username: admin
+    password: admin

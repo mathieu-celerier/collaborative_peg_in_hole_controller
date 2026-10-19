@@ -58,6 +58,19 @@
                 # the working superbuild run peaks at |alphaDOut| = 16 over 26 s.
                 configurations.CollabPegInHoleController.timeStep = 0.001;
 
+                # The real arm. mc_kortex from the store rather than whatever is on PATH (a
+                # workspace build is linked against a different mc_rtc), and the Kortex block
+                # appended to MC_RTC_CONTROLLER_CONFIG: the user configuration is not loaded
+                # (see above), so ~/.config/mc_rtc/mc_rtc.yaml cannot supply it. Both shells
+                # need it - the devel one reads `devel.extraConfigFiles`, not `runtime.*`.
+                configurations.CollabPegInHoleController.runtime = {
+                  apps = [ pkgs.mc-kortex ];
+                  extraConfigFiles = [ "${./etc/mc_kortex.yaml}" ];
+                };
+                configurations.CollabPegInHoleController.devel.extraConfigFiles = [
+                  "${./etc/mc_kortex.yaml}"
+                ];
+
                 # src/OnnxBackend.cpp runs the RoboManipBaselines policies. package.nix's
                 # propagatedBuildInputs covers the release build, but the devel shell is
                 # assembled from `devel.*` and `extraBuildInputs` only — and `inputsFrom` reads
@@ -66,7 +79,13 @@
                 # CMAKE_PREFIX_PATH. This is the option that puts them there, and it covers the
                 # runtime shell too, where LD_LIBRARY_PATH has to carry libonnxruntime.so for
                 # the locally-built controller.
-                extraBuildInputs = [ pkgs.onnxruntime ];
+                #
+                # ros2topic: the shell's ros2cli has no `topic` verb on its own, and
+                # `ros2 topic hz/echo /bota_ft_sensor/wrench` is the check for the F/T channel.
+                extraBuildInputs = [
+                  pkgs.onnxruntime
+                  pkgs.rosPackages.jazzy.ros2topic
+                ];
 
                 configurations.CollabPegInHoleController.devel.apps = [
                   # This derivation is never built: `inputsFrom` only reads its dependency
